@@ -28,7 +28,7 @@ import gc
 
 # 0. CONFIGURATION (change LLMs according to computing power)
 
-LLM_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 VLM_MODEL_NAME = "HuggingFaceTB/SmolVLM-500M-Instruct"
 CLIP_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
 
@@ -39,6 +39,9 @@ MAX_INDEX_IMAGES = 1500
 
 RETRIEVAL_TOP_K = 7
 VECTOR_SEARCH_K = 15
+
+VECTOR_SIMILARITY_TRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
+
 
 
 # 1. DATABASE SETUP & SCHEMA EXTRACTION
@@ -195,7 +198,7 @@ except Exception as vlm_err:
     print(f"[VLM Warning] Could not load VLM: {vlm_err}")
 
 
-def _analyze_image(self, user_image: Image.Image) -> str:
+def analyze_image(user_image: Image.Image) -> str:
         """
         Analyzes an uploaded image using the VLM
         """
@@ -231,7 +234,9 @@ def _analyze_image(self, user_image: Image.Image) -> str:
             text = vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             if "Assistant:" in text:
                 text = text.split("Assistant:")[-1].strip()
-            return text.strip()
+            text = text.strip()
+            print(f"[VLM] Description generated: {text}")
+            return text
         except Exception as e:
             print(f"[VLM Error] {e}")
             return ""
@@ -314,9 +319,9 @@ faiss_index, faiss_row_ids = build_or_load_faiss_index(conn, MAIN_TABLE, IMAGE_C
 
 # 6. RECIPROCAL RANK FUSION (RRF)
 
-def reciprocal_rank_fusion(sql_ids: list, vector_ids: list, k: int = 60, top_n: int = 7) -> list:
+def reciprocal_rank_fusion(sql_ids: list, vector_ids: list, k: int = 60, top_n: int = RETRIEVAL_TOP_K) -> list:
     """
-    Combines ranked lists from SQL and vector searches using Reciprocal Rank Fusion
+    Combines ranked lists from SQL and vector search using Reciprocal Rank Fusion
     Score(d) = sum(1 / (k + rank_i))
     """
 
@@ -356,12 +361,30 @@ class ResearchEngine:
         self.current_image_urls = []
         self.last_sql_query = ""
         self.last_vector_ids = []
+        self.last_vector_scores = {}
+        self.current_source_map = {}
+
+        self._trace_buffer = []
+        self.last_trace = ""
 
         # Conversation state (persists across follow-up turns, reset on new search)
         self.history = []  # list of {"role": "user"/"assistant", "content": str}
 
         # Session log for the whole run
         self.session_log = []
+
+    # Tracing
+
+    def _trace_reset(self):
+        self._trace_buffer = []
+
+    def _trace(self, line: str):
+        print(line)
+        self._trace_buffer.append(line)
+
+    def _trace_finalize(self) -> str:
+        self.last_trace = "\n".join(self._trace_buffer)
+        return self.last_trace
 
     # SQL
 
@@ -393,7 +416,12 @@ class ResearchEngine:
     #  Vector search
 
     def vector_search(self, text: Optional[str] = None, image: Optional[Image.Image] = None,
-                      k: int = VECTOR_SEARCH_K) -> list:
+                      k: int = VECTOR_SEARCH_K, treshold: float = VECTOR_SIMILARITY_TRESHOLD) -> list:
+        """
+        Returns a list of pairs (rowID, score), filtered by the treshold; image takes priority over text,
+        CLIP embeds one query vector per call
+        """
+
         if self.faiss_index.ntotal == 0 or len(self.row_ids) == 0:
             return []
         if image is not None:
@@ -405,18 +433,29 @@ class ResearchEngine:
         if vec.ndim == 1:
             vec = np.expand_dims(vec, axis=0)
         faiss.normalize_L2(vec)
-        _, indices = self.faiss_index.search(vec, k)
-        return [int(self.row_ids[i]) for i in indices[0] if i != -1 and i < len(self.row_ids)]
+        scores, indices = self.faiss_index.search(vec, k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1 or idx >= len(self.row_ids):
+                continue
+            if score < treshold:
+                continue
+            results.append((int(self.row_ids[idx]), float(score)))
+        return results
+
 
     # Context fetching
 
-    def fetch_context(self, hybrid_ids: list):
+    def fetch_context(self, hybrid_ids: list, source_map: Optional[dict] = None):
         """
         Returns (context_str, image_urls, dataframe) for the given rowids, in rank order
+        source_map = maps rowid so results table can show why each row was retrieved
         """
 
         if not hybrid_ids:
             return "", [], pd.DataFrame()
+        source_map = source_map or {}
 
         cursor = self.db_conn.cursor()
         placeholders = ",".join("?" for _ in hybrid_ids)
@@ -432,7 +471,16 @@ class ResearchEngine:
             row = row_dict[rid]
             details = [f"{c}: {v}" for c, v in zip(columns, row) if v and str(v).strip()]
             context_parts.append(f"[Artwork #{idx} - ID {rid}] " + " | ".join(details))
-            table_rows.append({"Artwork #": idx, "rowid": rid, **{c: v for c, v in zip(columns, row)}})
+
+            src = source_map.get(rid, {})
+            found_via = "+".join(filter(None, ["SQL" if src.get("sql") else "", "Vector" if src.get("vector") else ""])) or "?"
+            table_rows.append({
+                "Artwork #": idx,
+                "rowid": rid,
+                "found_via": found_via,
+                "vector_similarity": round(src["vector_score"], 3) if src.get("vector_score") is not None else "",
+                **{c: v for c, v in zip(columns, row)},
+                              })
 
             for c, v in zip(columns, row):
                 if self.image_col and c == self.image_col and isinstance(v, str) and v.startswith("http"):
@@ -460,41 +508,81 @@ class ResearchEngine:
 
     # Top-level orchestration
 
-    def new_search(self, user_input: str, user_image: Optional[Image.Image] = None):
+    def new_search(self, user_input: str, user_image: Optional[Image.Image] = None,
+                   include_vector_for_text: bool = False):
         """
-        Full pipeline: SQL + vector search -> RRF -> reset conversation -> synthesize
+        Full pipeline: SQL + optional vector search -> RRF -> reset conversation -> synthesize
+        Vector search always runs when an image is uploaded, but is optional for text-only queries0
         """
 
+        self._trace_reset()
+        self._trace(f"[New search] query={user_input!r}, image_uploaded={user_image is not None}, "
+                    f"include_vector_for_text={include_vector_for_text}")
+
         image_analysis = analyze_image(user_image) if user_image is not None else ""
+        self._trace(
+            f"[VLM] {'Description: ' + image_analysis if image_analysis else '(no image uploaded, VLM skipped)'}")
+
         combined_query_for_sql = (user_input or "").strip()
         if image_analysis:
             combined_query_for_sql = (combined_query_for_sql + " " + image_analysis).strip()
+        self._trace(f"[SQL] Query sent to LLM for translation: {combined_query_for_sql!r}")
 
         sql_query, sql_ids = "", []
         if combined_query_for_sql:
             try:
                 sql_query = self.generate_sql(combined_query_for_sql)
+                self._trace(f"[SQL] Generated SQL: {sql_query}")
                 sql_ids = self.run_sql(sql_query)
+                self._trace(f"[SQL] Matched {len(sql_ids)} row(s): {sql_ids}")
             except Exception as e:
-                print(f"[SQL Error] {e}")
+                self._trace(f"[SQL Error] {e}")
+        else:
+            self._trace("[SQL] Skipped (no text query and no image description).")
 
-        vector_ids = self.vector_search(text=user_input, image=user_image, k=VECTOR_SEARCH_K)
+        run_vector = (user_image is not None) or include_vector_for_text
+        if run_vector:
+            mode = "image" if user_image is not None else "text (opt-in)"
+            self._trace(f"[Vector] Running CLIP search, mode={mode}, threshold={VECTOR_SIMILARITY_TRESHOLD}")
+            vector_hits = self.vector_search(text=user_input, image=user_image, k=VECTOR_SEARCH_K)
+            if vector_hits:
+                scored = ", ".join(f"{rid}:{score:.3f}" for rid, score in vector_hits)
+                self._trace(f"[Vector] {len(vector_hits)} candidate(s) above threshold: {scored}")
+            else:
+                self._trace("[Vector] No candidates above the similarity threshold.")
+        else:
+            vector_hits = []
+            self._trace("[Vector] Skipped (text-only query, 'include visual similarity' not checked).")
+        vector_ids = [rid for rid, _ in vector_hits]
+        vector_scores = {rid: score for rid, score in vector_hits}
 
         if sql_ids:
             sql_set = set(sql_ids)
             filtered_vector_ids = [v for v in vector_ids if v in sql_set]
+            self._trace(f"[RRF] SQL results present — vector candidates restricted to SQL's rowid set: "
+                        f"{filtered_vector_ids} (of {vector_ids})")
             hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids)
         else:
             hybrid_ids = reciprocal_rank_fusion(sql_ids, vector_ids)
 
-        context_str, image_urls, df = self.fetch_context(hybrid_ids)
+        self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
+
+        sql_set, vector_set = set(sql_ids), set(vector_ids)
+        source_map = {
+            rid: {"sql": rid in sql_set, "vector": rid in vector_set, "vector_score": vector_scores.get(rid)}
+            for rid in hybrid_ids
+        }
+
+        context_str, image_urls, df = self.fetch_context(hybrid_ids, source_map)
 
         # Reset retrieval + conversation state
         self.current_context_str = context_str
         self.current_hybrid_ids = hybrid_ids
         self.current_image_urls = image_urls
+        self.current_source_map = source_map
         self.last_sql_query = sql_query
         self.last_vector_ids = vector_ids
+        self.last_vector_scores = vector_scores
         self.history = []
 
         if not hybrid_ids:
@@ -506,7 +594,9 @@ class ResearchEngine:
             answer = self.synthesize(question, image_analysis=image_analysis)
 
         self._log(mode="new_search", query=user_input, sql=sql_query, answer=answer)
-        return {"answer": answer, "images": image_urls, "sql": sql_query, "table": df}
+        trace = self._trace_finalize()
+        return {"answer": answer, "images": image_urls, "sql": sql_query, "table": df, "trace": trace, "vlm_description": image_analysis}
+
 
     def follow_up(self, user_question: str):
         """
@@ -516,30 +606,53 @@ class ResearchEngine:
         if not self.current_context_str:
             return self.new_search(user_question)
 
+        self._trace_reset()
+        self._trace(f"[Follow-up] query={user_question!r}")
+        self._trace(f"[Follow-up] No retrieval re-run. Reusing {len(self.current_hybrid_ids)} artwork(s) "
+                    f"from the last search: {self.current_hybrid_ids}")
+        self._trace(f"[Follow-up] Conversation history so far: {len(self.history) // 2} prior turn(s)")
+
         answer = self.synthesize(user_question)
         self._log(mode="follow_up", query=user_question, sql=self.last_sql_query, answer=answer)
-        _, _, df = self.fetch_context(self.current_hybrid_ids)
-        return {"answer": answer, "images": self.current_image_urls, "sql": self.last_sql_query, "table": df}
+        _, _, df = self.fetch_context(self.current_hybrid_ids, self.current_source_map)
+        trace = self._trace_finalize()
+        return {"answer": answer, "images": self.current_image_urls, "sql": self.last_sql_query, "table": df,
+                "trace": trace, "vlm_description": ""}
 
     def rerun_edited_sql(self, edited_sql: str):
         """
         Re-run a researcher-edited SQL string, keep prior vector ids, refresh context, resynthesize
         """
 
+        self._trace_reset()
+        self._trace(f"[Re-run SQL] Researcher-edited query: {edited_sql}")
         try:
             sql_ids = self.run_sql(edited_sql)
+            self._trace(f"[Re-run SQL] Matched {len(sql_ids)} row(s): {sql_ids}")
         except Exception as e:
-            return {"answer": f"SQL rejected: {e}", "images": [], "sql": edited_sql, "table": pd.DataFrame()}
+            self._trace(f"[Re-run SQL Error] {e}")
+            return {"answer": f"SQL rejected: {e}", "images": [], "sql": edited_sql, "table": pd.DataFrame(),
+                    "trace": self._trace_finalize(), "vlm_description": ""}
 
         sql_set = set(sql_ids)
         filtered_vector_ids = [v for v in self.last_vector_ids if v in sql_set]
+        self._trace(f"[RRF] Reusing vector scores from the last search. Vector candidates restricted to "
+                    f"SQL's rowid set: {filtered_vector_ids} (of {self.last_vector_ids})")
         hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids) if sql_ids else reciprocal_rank_fusion(
             sql_ids, self.last_vector_ids)
+        self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
 
-        context_str, image_urls, df = self.fetch_context(hybrid_ids)
+        vector_set = set(self.last_vector_ids)
+        source_map = {
+            rid: {"sql": rid in sql_set, "vector": rid in vector_set, "vector_score": self.last_vector_scores.get(rid)}
+            for rid in hybrid_ids
+        }
+
+        context_str, image_urls, df = self.fetch_context(hybrid_ids, source_map)
         self.current_context_str = context_str
         self.current_hybrid_ids = hybrid_ids
         self.current_image_urls = image_urls
+        self.current_source_map = source_map
         self.last_sql_query = edited_sql
         self.history = []
 
@@ -549,7 +662,9 @@ class ResearchEngine:
             answer = self.synthesize("Describe and compare the retrieved artworks.")
 
         self._log(mode="rerun_sql", query="(edited SQL)", sql=edited_sql, answer=answer)
-        return {"answer": answer, "images": image_urls, "sql": edited_sql, "table": df}
+        trace = self._trace_finalize()
+        return {"answer": answer, "images": image_urls, "sql": edited_sql, "table": df, "trace": trace,
+                "vlm_description": ""}
 
     def _log(self, mode: str, query: str, sql: str, answer: str):
         self.session_log.append({
@@ -574,19 +689,22 @@ engine = ResearchEngine(conn, MAIN_TABLE, IMAGE_COLUMN, faiss_index, faiss_row_i
 
 # 8. GRADIO FRONTEND INTERFACE
 
-def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str):
+
+def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str, include_vector_for_text: bool):
     if (not user_query or not user_query.strip()) and uploaded_image is None and mode == "New search":
-        return "Please provide a question or upload an image.", [], "", pd.DataFrame(), pd.DataFrame(engine.session_log)
+        return ("Please provide a question or upload an image.", [], "", pd.DataFrame(),
+                pd.DataFrame(engine.session_log), "", "")
     try:
         image = uploaded_image.convert("RGB") if uploaded_image is not None else None
         if mode == "New search":
-            result = engine.new_search(user_query, image)
+            result = engine.new_search(user_query, image, include_vector_for_text=include_vector_for_text)
         else:
             result = engine.follow_up(user_query)
         log_df = pd.DataFrame(engine.session_log)
-        return result["answer"], result["images"], result["sql"], result["table"], log_df
+        return (result["answer"], result["images"], result["sql"], result["table"], log_df,
+                result.get("trace", ""), result.get("vlm_description", ""))
     except Exception as e:
-        return f"Error: {e}", [], "", pd.DataFrame(), pd.DataFrame(engine.session_log)
+        return f"Error: {e}", [], "", pd.DataFrame(), pd.DataFrame(engine.session_log), "", ""
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -597,9 +715,10 @@ def handle_rerun_sql(edited_sql: str):
     try:
         result = engine.rerun_edited_sql(edited_sql)
         log_df = pd.DataFrame(engine.session_log)
-        return result["answer"], result["images"], result["sql"], result["table"], log_df
+        return (result["answer"], result["images"], result["sql"], result["table"], log_df,
+                result.get("trace", ""), result.get("vlm_description", ""))
     except Exception as e:
-        return f"Error: {e}", [], edited_sql, pd.DataFrame(), pd.DataFrame(engine.session_log)
+        return f"Error: {e}", [], edited_sql, pd.DataFrame(), pd.DataFrame(engine.session_log), "", ""
 
 
 def handle_export_log():
@@ -612,7 +731,8 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
         # Rijksmuseum Graphic Arts Research Assistant
         Hybrid Text-to-SQL + multimodal vector search over the early modern prints and
         drawings collection. The generated SQL and retrieved records are shown below so
-        you can inspect and correct retrieval, not just the final answer.
+        you can inspect and correct retrieval, not just the final answer — including
+        whether each row came from SQL, visual similarity, or both.
         """
     )
 
@@ -626,6 +746,16 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
             user_input = gr.Textbox(label="Question", lines=3,
                                     placeholder="e.g. Which prints were produced by Cornelis Cort?")
             image_input = gr.Image(label="Upload image (optional, new search only)", type="pil")
+            vector_for_text_checkbox = gr.Checkbox(
+                label="Also use visual similarity search (CLIP) for this text query",
+                value=False,
+                info=(
+                    "Off by default: CLIP text-image matching only works well for short, "
+                    "topic-heavy phrasing (e.g. 'farm animals', 'landscapes'), not specific or "
+                    "technical questions, so it's opt-in to avoid diluting results. Always runs "
+                    "automatically when you upload an image instead."
+                ),
+            )
             submit_btn = gr.Button("Submit", variant="primary")
 
             gr.Markdown("**Generated SQL** (editable — edit and re-run to steer retrieval directly)")
@@ -639,21 +769,23 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
             output_answer = gr.Textbox(label="Answer", lines=10, interactive=False)
             output_gallery = gr.Gallery(label="Matched artwork images", columns=3, height=300)
             output_table = gr.Dataframe(label="Retrieved records", wrap=True)
+            vlm_box = gr.Textbox(label="VLM description of uploaded image", lines=3, interactive=False)
+            with gr.Accordion("Retrieval trace (debug)", open=False):
+                trace_box = gr.Textbox(label="Step-by-step trace", lines=16, interactive=False)
             session_log_table = gr.Dataframe(label="Session log", wrap=True)
 
     submit_btn.click(
         fn=handle_query,
-        inputs=[user_input, image_input, mode_toggle],
-        outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table],
+        inputs=[user_input, image_input, mode_toggle, vector_for_text_checkbox],
+        outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box],
     )
     rerun_btn.click(
         fn=handle_rerun_sql,
         inputs=[sql_box],
-        outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table],
+        outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box],
     )
     export_btn.click(fn=handle_export_log, outputs=[export_file])
 
 if __name__ == "__main__":
-    # share=True for Colab (has no accessible localhost)
-    demo.queue().launch(share=False, debug=True)
-
+    # share=True because Colab has no accessible localhost.
+    demo.queue().launch(share=False, debug=False)
