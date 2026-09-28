@@ -1,5 +1,5 @@
 """
-Rijksmuseum Graphics Arts AI Assistant - A hybrid Text-to-SQL and Multimodal Vector Search AI system with Gradio UI
+Rijksmuseum Graphics Arts AI Assistant - A Text-to-SQL and Multimodal Vector Search AI system with Gradio UI
 ---
 python -m pip install torch transformers faiss-cpu accelerate numpy requests gradio pillow sentence-transformers pandas bitsandbytes
 """
@@ -41,7 +41,6 @@ RETRIEVAL_TOP_K = 7
 VECTOR_SEARCH_K = 15
 
 VECTOR_SIMILARITY_TRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
-
 
 
 # 1. DATABASE SETUP & SCHEMA EXTRACTION
@@ -364,6 +363,9 @@ class ResearchEngine:
         self.last_vector_scores = {}
         self.current_source_map = {}
 
+        self.current_image_analysis = ""
+        self.last_search_was_image = False
+
         self._trace_buffer = []
         self.last_trace = ""
 
@@ -387,6 +389,27 @@ class ResearchEngine:
         return self.last_trace
 
     # SQL
+
+    def extract_filter_hints(self, caption: str) -> str:
+        """
+        EXPERIMENTAL (only used when the researcher ticks the 'use image description to
+        filter by metadata' box). Instead of pushing a long free-form caption into the
+        SQL prompt, ask the LLM to condense it into at most two short English keywords:
+        the object type (print / drawing) and one subject word (portrait, landscape, ...).
+        Keeping this narrow limits how much a VLM misreading can over-constrain the query.
+        """
+        messages = [
+            {"role": "system", "content": (
+                "You extract search keywords from an image description of an artwork. "
+                "Reply with at most TWO lowercase English words separated by a comma: "
+                "first the object type (print or drawing), then one main subject "
+                "(e.g. portrait, landscape, ship, animal). If unsure about either, leave it out. "
+                "Reply with the keywords only."
+            )},
+            {"role": "user", "content": caption},
+        ]
+        hints = generate_chat(messages, max_new_tokens=15, temperature=0.0)
+        return hints.strip().splitlines()[0][:60] if hints.strip() else ""
 
     def generate_sql(self, natural_language_query: str) -> str:
         messages = [
@@ -492,10 +515,14 @@ class ResearchEngine:
 
     # Synthesis
 
-    def synthesize(self, user_question: str, image_analysis: str = "") -> str:
+    def synthesize(self, user_question: str) -> str:
         system_content = SYNTHESIS_SYS_TEMPLATE.format(context=self.current_context_str)
-        if image_analysis:
-            system_content += f"\nVisual analysis of researcher's uploaded image:\n{image_analysis}\n"
+        if self.current_image_analysis:
+            system_content += (
+                "\nThe researcher also uploaded an image. An automatic (small-model) description "
+                "of it follows; treat it as a rough, possibly inaccurate aid, not as fact:\n"
+                f"{self.current_image_analysis}\n"
+            )
 
         messages = [{"role": "system", "content": system_content}] + self.history
         messages.append({"role": "user", "content": user_question})
@@ -509,39 +536,53 @@ class ResearchEngine:
     # Top-level orchestration
 
     def new_search(self, user_input: str, user_image: Optional[Image.Image] = None,
-                   include_vector_for_text: bool = False):
+                   include_vector_for_text: bool = False, use_caption_for_sql: bool = False):
         """
         Full pipeline: SQL + optional vector search -> RRF -> reset conversation -> synthesize
-        Vector search always runs when an image is uploaded, but is optional for text-only queries0
+
+        - SQL handles what the researcher TYPED (plus, optionally, condensed image hints)
+
+        - CLIP finds visually similar artworks from an uploaded image (always runs in image
+          mode; opt-in for text-only queries via `include_vector_for_text`)
+
+        - The VLM caption is a soft input for the answer LLM and a visible aid for the
+          researcher. It is NOT pushed into SQL unless `use_caption_for_sql` is True, because
+          a small VLM's guesses become hard WHERE filters that silently exclude good matches
+
         """
 
         self._trace_reset()
-        self._trace(f"[New search] query={user_input!r}, image_uploaded={user_image is not None}, "
-                    f"include_vector_for_text={include_vector_for_text}")
+        image_mode = user_image is not None
+        self._trace(f"[New search] query={user_input!r}, image_uploaded={image_mode}, "
+                    f"include_vector_for_text={include_vector_for_text}, use_caption_for_sql={use_caption_for_sql}")
 
-        image_analysis = analyze_image(user_image) if user_image is not None else ""
+        image_analysis = analyze_image(user_image) if image_mode else ""
         self._trace(
             f"[VLM] {'Description: ' + image_analysis if image_analysis else '(no image uploaded, VLM skipped)'}")
 
-        combined_query_for_sql = (user_input or "").strip()
-        if image_analysis:
-            combined_query_for_sql = (combined_query_for_sql + " " + image_analysis).strip()
-        self._trace(f"[SQL] Query sent to LLM for translation: {combined_query_for_sql!r}")
+        sql_question = (user_input or "").strip()
+        if image_analysis and use_caption_for_sql:
+            hints = self.extract_filter_hints(image_analysis)
+            self._trace(f"[SQL] Experimental: condensed image hints for SQL = {hints!r}")
+            if hints:
+                sql_question = f"{sql_question} {hints}".strip()
+        elif image_analysis:
+            self._trace("[SQL] Image description is NOT used for SQL (experimental filter option is off).")
+        self._trace(f"[SQL] Question sent to LLM for translation: {sql_question!r}")
 
         sql_query, sql_ids = "", []
-        if combined_query_for_sql:
+        if sql_question:
             try:
-                sql_query = self.generate_sql(combined_query_for_sql)
+                sql_query = self.generate_sql(sql_question)
                 self._trace(f"[SQL] Generated SQL: {sql_query}")
                 sql_ids = self.run_sql(sql_query)
                 self._trace(f"[SQL] Matched {len(sql_ids)} row(s): {sql_ids}")
             except Exception as e:
                 self._trace(f"[SQL Error] {e}")
         else:
-            self._trace("[SQL] Skipped (no text query and no image description).")
+            self._trace("[SQL] Skipped (no typed question: image-only search relies on CLIP).")
 
-        run_vector = (user_image is not None) or include_vector_for_text
-        if run_vector:
+        if image_mode:
             mode = "image" if user_image is not None else "text (opt-in)"
             self._trace(f"[Vector] Running CLIP search, mode={mode}, threshold={VECTOR_SIMILARITY_TRESHOLD}")
             vector_hits = self.vector_search(text=user_input, image=user_image, k=VECTOR_SEARCH_K)
@@ -556,13 +597,16 @@ class ResearchEngine:
         vector_ids = [rid for rid, _ in vector_hits]
         vector_scores = {rid: score for rid, score in vector_hits}
 
-        if sql_ids:
+        if sql_ids and not image_mode:
             sql_set = set(sql_ids)
             filtered_vector_ids = [v for v in vector_ids if v in sql_set]
-            self._trace(f"[RRF] SQL results present — vector candidates restricted to SQL's rowid set: "
+            self._trace(f"[RRF] Text mode with SQL results — vector candidates restricted to SQL's rowid set: "
                         f"{filtered_vector_ids} (of {vector_ids})")
             hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids)
         else:
+            if image_mode:
+                self._trace("[RRF] Image mode — SQL and vector hits are UNIONED (a typed filter can boost "
+                            "results but never excludes visually similar matches).")
             hybrid_ids = reciprocal_rank_fusion(sql_ids, vector_ids)
 
         self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
@@ -583,6 +627,8 @@ class ResearchEngine:
         self.last_sql_query = sql_query
         self.last_vector_ids = vector_ids
         self.last_vector_scores = vector_scores
+        self.current_image_analysis = image_analysis
+        self.last_search_was_image = image_mode
         self.history = []
 
         if not hybrid_ids:
@@ -590,12 +636,18 @@ class ResearchEngine:
                 f"\n\nImage analysis:\n{image_analysis}" if image_analysis else "")
             self.history = [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
         else:
-            question = user_input.strip() if user_input and user_input.strip() else "Describe and compare the retrieved artworks."
-            answer = self.synthesize(question, image_analysis=image_analysis)
+            if user_input and user_input.strip():
+                question = user_input.strip()
+            elif image_mode:
+                question = "Describe the retrieved artworks and how they relate to the uploaded image."
+            else:
+                question = "Describe and compare the retrieved artworks."
+            answer = self.synthesize(question)
 
         self._log(mode="new_search", query=user_input, sql=sql_query, answer=answer)
         trace = self._trace_finalize()
-        return {"answer": answer, "images": image_urls, "sql": sql_query, "table": df, "trace": trace, "vlm_description": image_analysis}
+        return {"answer": answer, "images": image_urls, "sql": sql_query, "table": df, "trace": trace,
+                "vlm_description": image_analysis}
 
 
     def follow_up(self, user_question: str):
@@ -617,7 +669,7 @@ class ResearchEngine:
         _, _, df = self.fetch_context(self.current_hybrid_ids, self.current_source_map)
         trace = self._trace_finalize()
         return {"answer": answer, "images": self.current_image_urls, "sql": self.last_sql_query, "table": df,
-                "trace": trace, "vlm_description": ""}
+                "trace": trace, "vlm_description": self.current_image_analysis}
 
     def rerun_edited_sql(self, edited_sql: str):
         """
@@ -635,11 +687,16 @@ class ResearchEngine:
                     "trace": self._trace_finalize(), "vlm_description": ""}
 
         sql_set = set(sql_ids)
-        filtered_vector_ids = [v for v in self.last_vector_ids if v in sql_set]
-        self._trace(f"[RRF] Reusing vector scores from the last search. Vector candidates restricted to "
-                    f"SQL's rowid set: {filtered_vector_ids} (of {self.last_vector_ids})")
-        hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids) if sql_ids else reciprocal_rank_fusion(
-            sql_ids, self.last_vector_ids)
+        if sql_ids and not self.last_search_was_image:
+            filtered_vector_ids = [v for v in self.last_vector_ids if v in sql_set]
+            self._trace(f"[RRF] Reusing vector scores from the last search. Text mode - vector candidates"
+                        f"Restricted to SQL's rowid set: {filtered_vector_ids} (of {self.last_vector_ids})")
+            hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids)
+        else:
+            if self.last_search_was_image:
+                self._trace("[RRF] Reusing vector scores from the last (image) search. Image mode — SQL and "
+                            "vector hits are UNIONED.")
+            hybrid_ids = reciprocal_rank_fusion(sql_ids, self.last_vector_ids)
         self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
 
         vector_set = set(self.last_vector_ids)
@@ -664,7 +721,7 @@ class ResearchEngine:
         self._log(mode="rerun_sql", query="(edited SQL)", sql=edited_sql, answer=answer)
         trace = self._trace_finalize()
         return {"answer": answer, "images": image_urls, "sql": edited_sql, "table": df, "trace": trace,
-                "vlm_description": ""}
+                "vlm_description": self.current_image_analysis}
 
     def _log(self, mode: str, query: str, sql: str, answer: str):
         self.session_log.append({
@@ -690,14 +747,16 @@ engine = ResearchEngine(conn, MAIN_TABLE, IMAGE_COLUMN, faiss_index, faiss_row_i
 # 8. GRADIO FRONTEND INTERFACE
 
 
-def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str, include_vector_for_text: bool):
+def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str,
+                 include_vector_for_text: bool, use_caption_for_sql: bool):
     if (not user_query or not user_query.strip()) and uploaded_image is None and mode == "New search":
         return ("Please provide a question or upload an image.", [], "", pd.DataFrame(),
                 pd.DataFrame(engine.session_log), "", "")
     try:
         image = uploaded_image.convert("RGB") if uploaded_image is not None else None
         if mode == "New search":
-            result = engine.new_search(user_query, image, include_vector_for_text=include_vector_for_text)
+            result = engine.new_search(user_query, image, include_vector_for_text=include_vector_for_text,
+                                       use_caption_for_sql=use_caption_for_sql)
         else:
             result = engine.follow_up(user_query)
         log_df = pd.DataFrame(engine.session_log)
@@ -729,7 +788,7 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
     gr.Markdown(
         """
         # Rijksmuseum Graphic Arts Research Assistant
-        Hybrid Text-to-SQL + multimodal vector search over the early modern prints and
+        Text-to-SQL + multimodal vector search over the early modern prints and
         drawings collection. The generated SQL and retrieved records are shown below so
         you can inspect and correct retrieval, not just the final answer — including
         whether each row came from SQL, visual similarity, or both.
@@ -756,6 +815,16 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
                     "automatically when you upload an image instead."
                 ),
             )
+            caption_for_sql_checkbox = gr.Checkbox(
+                label="Use image description to filter by metadata (experimental)",
+                value=False,
+                info=(
+                    "Off by default. The small vision model's description is always shown to the "
+                    "answer model as context, but it can misjudge medium or period, and as an SQL "
+                    "filter those mistakes would silently exclude good matches. When ticked, only "
+                    "two condensed keywords (object type, subject) are added to your typed question."
+                ),
+            )
             submit_btn = gr.Button("Submit", variant="primary")
 
             gr.Markdown("**Generated SQL** (editable — edit and re-run to steer retrieval directly)")
@@ -776,7 +845,7 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
 
     submit_btn.click(
         fn=handle_query,
-        inputs=[user_input, image_input, mode_toggle, vector_for_text_checkbox],
+        inputs=[user_input, image_input, mode_toggle, vector_for_text_checkbox, caption_for_sql_checkbox],
         outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box],
     )
     rerun_btn.click(
@@ -787,5 +856,6 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
     export_btn.click(fn=handle_export_log, outputs=[export_file])
 
 if __name__ == "__main__":
-    # share=True because Colab has no accessible localhost.
+    # share=True for Colab (has no accessible localhost)
     demo.queue().launch(share=False, debug=False)
+

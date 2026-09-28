@@ -1,4 +1,4 @@
-*Rijksmuseum Graphics Arts AI Assistant - A hybrid Text-to-SQL and Multimodal Vector Search AI system with Gradio UI.*
+*Rijksmuseum Graphics Arts AI Assistant - A Text-to-SQL and multimodal vector search AI system with Gradio UI.*
 ---
 *This prototype allows users to interact with the collection of early modern prints and drawings of the Rijksmuseum, using both natural language and images.*
 
@@ -9,6 +9,6 @@ After importing the CSV, run the preprocessor.py script to create the SQLite dat
 
 This model only works on the subcollection (250 000 records of total 600 000) of early modern prints and drawings. Naturally, only the images of this subcollection are embedded and retrievable (roughly 200 000). NOTE: creating the image embeddings is computationally intensive, hence the 'max_images' guardrail. Use a GPU or tone down the max number of images. Upscale the size of the LLMs depending on your computational power.
 
-<img width="1907" height="1052" alt="Schermafbeelding 2026-08-26 114510" src="https://github.com/user-attachments/assets/a3d8dc44-c625-417d-b764-aebf4929c217" />
+![Schermafbeelding 2026-09-28 145359.png](../../Downloads/Schermafbeelding%202026-09-28%20145359.png)
 
-
+![Schermafbeelding 2026-09-28 145529.png](../../Downloads/Schermafbeelding%202026-09-28%20145529.png)
