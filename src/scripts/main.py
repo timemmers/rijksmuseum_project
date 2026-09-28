@@ -21,7 +21,7 @@ import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, AutoProcessor, \
-    AutoModelForImageTextToText, BitsAndBytesConfig, AutoModel
+    AutoModelForImageTextToText, BitsAndBytesConfig
 import gradio as gr
 import gc
 
@@ -40,7 +40,7 @@ MAX_INDEX_IMAGES = 1500
 RETRIEVAL_TOP_K = 7
 VECTOR_SEARCH_K = 15
 
-VECTOR_SIMILARITY_TRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
+VECTOR_SIMILARITY_THRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
 
 
 # 1. DATABASE SETUP & SCHEMA EXTRACTION
@@ -146,7 +146,7 @@ tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
 llm_model = AutoModelForCausalLM.from_pretrained(
     LLM_MODEL_NAME,
     quantization_config=bnb_config,
-    device_map="auto",
+    device_map="cpu",
     trust_remote_code=True,
 )
 if tokenizer.pad_token_id is None:
@@ -190,7 +190,7 @@ try:
     vlm_model = AutoModelForImageTextToText.from_pretrained(
         VLM_MODEL_NAME,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto"
+        device_map="cpu"
     )
     print(f"[VLM] {VLM_MODEL_NAME} loaded successfully!")
 except Exception as vlm_err:
@@ -439,9 +439,9 @@ class ResearchEngine:
     #  Vector search
 
     def vector_search(self, text: Optional[str] = None, image: Optional[Image.Image] = None,
-                      k: int = VECTOR_SEARCH_K, treshold: float = VECTOR_SIMILARITY_TRESHOLD) -> list:
+                      k: int = VECTOR_SEARCH_K, threshold: float = VECTOR_SIMILARITY_THRESHOLD) -> list:
         """
-        Returns a list of pairs (rowID, score), filtered by the treshold; image takes priority over text,
+        Returns a list of pairs (rowID, score), filtered by the threshold; image takes priority over text,
         CLIP embeds one query vector per call
         """
 
@@ -462,7 +462,7 @@ class ResearchEngine:
         for score, idx in zip(scores[0], indices[0]):
             if idx == -1 or idx >= len(self.row_ids):
                 continue
-            if score < treshold:
+            if score < threshold:
                 continue
             results.append((int(self.row_ids[idx]), float(score)))
         return results
@@ -503,7 +503,7 @@ class ResearchEngine:
                 "found_via": found_via,
                 "vector_similarity": round(src["vector_score"], 3) if src.get("vector_score") is not None else "",
                 **{c: v for c, v in zip(columns, row)},
-                              })
+                })
 
             for c, v in zip(columns, row):
                 if self.image_col and c == self.image_col and isinstance(v, str) and v.startswith("http"):
@@ -582,10 +582,19 @@ class ResearchEngine:
         else:
             self._trace("[SQL] Skipped (no typed question: image-only search relies on CLIP).")
 
-        if image_mode:
-            mode = "image" if user_image is not None else "text (opt-in)"
-            self._trace(f"[Vector] Running CLIP search, mode={mode}, threshold={VECTOR_SIMILARITY_TRESHOLD}")
-            vector_hits = self.vector_search(text=user_input, image=user_image, k=VECTOR_SEARCH_K)
+        run_vector = image_mode or include_vector_for_text
+
+        if run_vector:
+            mode = "image" if image_mode else "text (opt-in)"
+            self._trace(f"[Vector] Running CLIP search, mode={mode}, treshold={VECTOR_SIMILARITY_THRESHOLD}")
+
+            vector_hits = self.vector_search(
+                text=user_input,
+                image=user_image if image_mode else None,
+                k=VECTOR_SEARCH_K,
+                threshold=VECTOR_SIMILARITY_THRESHOLD,
+            )
+
             if vector_hits:
                 scored = ", ".join(f"{rid}:{score:.3f}" for rid, score in vector_hits)
                 self._trace(f"[Vector] {len(vector_hits)} candidate(s) above threshold: {scored}")
@@ -594,6 +603,7 @@ class ResearchEngine:
         else:
             vector_hits = []
             self._trace("[Vector] Skipped (text-only query, 'include visual similarity' not checked).")
+
         vector_ids = [rid for rid, _ in vector_hits]
         vector_scores = {rid: score for rid, score in vector_hits}
 
