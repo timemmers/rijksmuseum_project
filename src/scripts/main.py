@@ -21,7 +21,7 @@ import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, AutoProcessor, \
-    AutoModelForImageTextToText, BitsAndBytesConfig, AutoModel
+    AutoModelForImageTextToText, BitsAndBytesConfig
 import gradio as gr
 import gc
 
@@ -40,7 +40,7 @@ MAX_INDEX_IMAGES = 1500
 RETRIEVAL_TOP_K = 7
 VECTOR_SEARCH_K = 15
 
-VECTOR_SIMILARITY_TRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
+VECTOR_SIMILARITY_THRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
 
 
 # 1. DATABASE SETUP & SCHEMA EXTRACTION
@@ -228,16 +228,23 @@ def analyze_image(user_image: Image.Image) -> str:
             device = next(vlm_model.parameters()).device
             inputs = inputs.to(device)
 
+            input_len = inputs["input_ids"].shape[1]
             with torch.no_grad():
-                generated_ids = vlm_model.generate(**inputs, max_new_tokens=220)
-            text = vlm_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            if "Assistant:" in text:
-                text = text.split("Assistant:")[-1].strip()
-            text = text.strip()
+                generated_ids = vlm_model.generate(
+                    **inputs,
+                    max_new_tokens=220,
+                    do_sample=True,
+                    temperature=0.3,
+                    top_p=0.85,
+                    repetition_penalty=1.1,
+                )
+
+            new_tokens = generated_ids[:, input_len:]
+            text = vlm_processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
             print(f"[VLM] Description generated: {text}")
             return text
         except Exception as e:
-            print(f"[VLM Error] {e}")
+            print(f"[VLM] Error: {e}")
             return ""
 
 
@@ -363,9 +370,14 @@ class ResearchEngine:
         self.last_vector_scores = {}
         self.current_source_map = {}
 
+        # The VLM caption of the uploaded image (if any) is kept for the whole retrieval
+        # session so follow-ups and SQL re-runs still "remember" what the image looked like.
         self.current_image_analysis = ""
+        # True if the last search was driven by an uploaded image; controls whether vector
+        # hits are unioned with SQL hits (image mode) or restricted to them (text mode).
         self.last_search_was_image = False
 
+        # Structured, per-query trace: every retrieval step gets logged here AND printed
         self._trace_buffer = []
         self.last_trace = ""
 
@@ -439,9 +451,9 @@ class ResearchEngine:
     #  Vector search
 
     def vector_search(self, text: Optional[str] = None, image: Optional[Image.Image] = None,
-                      k: int = VECTOR_SEARCH_K, treshold: float = VECTOR_SIMILARITY_TRESHOLD) -> list:
+                      k: int = VECTOR_SEARCH_K, threshold: float = VECTOR_SIMILARITY_THRESHOLD) -> list:
         """
-        Returns a list of pairs (rowID, score), filtered by the treshold; image takes priority over text,
+        Returns a list of pairs (rowID, score), filtered by the threshold; image takes priority over text,
         CLIP embeds one query vector per call
         """
 
@@ -462,7 +474,7 @@ class ResearchEngine:
         for score, idx in zip(scores[0], indices[0]):
             if idx == -1 or idx >= len(self.row_ids):
                 continue
-            if score < treshold:
+            if score < threshold:
                 continue
             results.append((int(self.row_ids[idx]), float(score)))
         return results
@@ -582,10 +594,17 @@ class ResearchEngine:
         else:
             self._trace("[SQL] Skipped (no typed question: image-only search relies on CLIP).")
 
-        if image_mode:
-            mode = "image" if user_image is not None else "text (opt-in)"
-            self._trace(f"[Vector] Running CLIP search, mode={mode}, threshold={VECTOR_SIMILARITY_TRESHOLD}")
-            vector_hits = self.vector_search(text=user_input, image=user_image, k=VECTOR_SEARCH_K)
+        run_vector = image_mode or include_vector_for_text
+        if run_vector:
+            mode = "image" if image_mode else "text (opt-in)"
+            self._trace(f"[Vector] Running CLIP search, mode={mode}, threshold={VECTOR_SIMILARITY_THRESHOLD}")
+
+            vector_hits = self.vector_search(
+                text=user_input,
+                image=user_image,
+                k=VECTOR_SEARCH_K,
+                threshold=VECTOR_SIMILARITY_THRESHOLD)
+
             if vector_hits:
                 scored = ", ".join(f"{rid}:{score:.3f}" for rid, score in vector_hits)
                 self._trace(f"[Vector] {len(vector_hits)} candidate(s) above threshold: {scored}")
@@ -605,8 +624,8 @@ class ResearchEngine:
             hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids)
         else:
             if image_mode:
-                self._trace("[RRF] Image mode — SQL and vector hits are UNIONED (a typed filter can boost "
-                            "results but never excludes visually similar matches).")
+                self._trace("[RRF] Image mode — SQL and vector are fused as two independent ranked lists "
+                            "(rows found by both rank highest; rows found by only one still appear).")
             hybrid_ids = reciprocal_rank_fusion(sql_ids, vector_ids)
 
         self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
@@ -695,7 +714,8 @@ class ResearchEngine:
         else:
             if self.last_search_was_image:
                 self._trace("[RRF] Reusing vector scores from the last (image) search. Image mode — SQL and "
-                            "vector hits are UNIONED.")
+                            "vector are fused as two independent ranked lists (rows found by both rank "
+                            "highest; rows found by only one still appear).")
             hybrid_ids = reciprocal_rank_fusion(sql_ids, self.last_vector_ids)
         self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
 
@@ -749,9 +769,17 @@ engine = ResearchEngine(conn, MAIN_TABLE, IMAGE_COLUMN, faiss_index, faiss_row_i
 
 def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str,
                  include_vector_for_text: bool, use_caption_for_sql: bool):
-    if (not user_query or not user_query.strip()) and uploaded_image is None and mode == "New search":
-        return ("Please provide a question or upload an image.", [], "", pd.DataFrame(),
-                pd.DataFrame(engine.session_log), "", "")
+    if not user_query or not user_query.strip():
+        if mode == "Follow-up (reason over current results)" or uploaded_image is None:
+            return (
+                "Please provide a question or upload an image.",
+                [],
+                "",
+                pd.DataFrame(),
+                pd.DataFrame(engine.session_log),
+                "",
+                ""
+            )
     try:
         image = uploaded_image.convert("RGB") if uploaded_image is not None else None
         if mode == "New search":
