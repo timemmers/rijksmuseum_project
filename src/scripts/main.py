@@ -1,5 +1,5 @@
 """
-Rijksmuseum Graphics Arts AI Assistant - A Text-to-SQL and Multimodal Vector Search AI system with Gradio UI
+Rijksmuseum graphics arts AI assistant - A text-to-SQL and multimodal vector search AI system with Gradio UI
 ---
 python -m pip install torch transformers faiss-cpu accelerate numpy requests gradio pillow sentence-transformers pandas bitsandbytes
 """
@@ -29,13 +29,17 @@ import gc
 # 0. CONFIGURATION (change LLMs according to computing power)
 
 LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+# e.g. Qwen3.5
 VLM_MODEL_NAME = "HuggingFaceTB/SmolVLM-500M-Instruct"
+# e.g. Qwen2.5-VL
 CLIP_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
+# generally not that many parameters
+
 
 CURRENT_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 DATABASE_PATH = CURRENT_DIR.parent / "preprocessing" / "rma_artworks"
 
-MAX_INDEX_IMAGES = 1500
+MAX_INDEX_IMAGES = 1500 # safeguard
 
 RETRIEVAL_TOP_K = 7
 VECTOR_SEARCH_K = 15
@@ -228,6 +232,7 @@ def analyze_image(user_image: Image.Image) -> str:
             device = next(vlm_model.parameters()).device
             inputs = inputs.to(device)
 
+            # Tweak these parameters for more (or less) creative descriptions; e.g do_sample false
             input_len = inputs["input_ids"].shape[1]
             with torch.no_grad():
                 generated_ids = vlm_model.generate(
@@ -539,7 +544,8 @@ class ResearchEngine:
         messages = [{"role": "system", "content": system_content}] + self.history
         messages.append({"role": "user", "content": user_question})
 
-        answer = generate_chat(messages, max_new_tokens=600, temperature=0.6, top_p=0.9, top_k=50)
+        # Tweakable parameters
+        answer = generate_chat(messages, max_new_tokens=900, temperature=0.6, top_p=0.9, top_k=50)
 
         self.history.append({"role": "user", "content": user_question})
         self.history.append({"role": "assistant", "content": answer})
