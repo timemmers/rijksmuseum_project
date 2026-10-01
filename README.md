@@ -9,7 +9,6 @@ After importing the CSV, run the preprocessor.py script to create the SQLite dat
 
 This model only works on the subcollection (250 000 records of total 600 000) of early modern prints and drawings. Naturally, only the images of this subcollection are embedded and retrievable (roughly 200 000). NOTE: creating the image embeddings is computationally intensive, hence the 'max_images' guardrail. Use a GPU or tone down the max number of images. Upscale the size of the LLMs depending on your computational power. More extensive documentation can be found in the rma_assistant_documentation.md file.
 
-<img width="1918" height="1082" alt="Schermafbeelding 2026-09-28 145359" src="https://github.com/user-attachments/assets/9afaccd5-aead-4f18-9470-b5b53c6c168c" />
+<img width="1885" height="1078" alt="Schermafbeelding 2026-10-01 145659" src="https://github.com/user-attachments/assets/c6833378-9952-4d2b-af41-1db3b63dd888" />
 
-<img width="1891" height="1082" alt="Schermafbeelding 2026-09-28 145529" src="https://github.com/user-attachments/assets/60f34b4e-9bf2-4d31-890f-38b4d1fbda50" />
-
+<img width="1893" height="1073" alt="Schermafbeelding 2026-10-01 145752" src="https://github.com/user-attachments/assets/ed4fcb2f-3cef-4898-9ef7-7f5bb2c551e2" />
