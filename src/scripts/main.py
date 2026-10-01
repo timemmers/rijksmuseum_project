@@ -1,17 +1,17 @@
 """
 Rijksmuseum graphics arts AI assistant - A text-to-SQL and multimodal vector search AI system with Gradio UI
 ---
-python -m pip install torch transformers faiss-cpu accelerate numpy requests gradio pillow sentence-transformers pandas bitsandbytes
+python -m pip install torch transformers faiss-cpu accelerate numpy gradio pillow sentence-transformers pandas bitsandbytes
 """
 
 from pathlib import Path
 import re
 import sqlite3
-import io
 from typing import Optional
 import csv
+import hashlib
+import json
 
-import requests
 from PIL import Image
 import numpy as np
 import faiss
@@ -33,29 +33,51 @@ LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 VLM_MODEL_NAME = "HuggingFaceTB/SmolVLM-500M-Instruct"
 # e.g. Qwen2.5-VL
 CLIP_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
-# generally not that many parameters
+# must be the model the FAISS index was built with
 
+ENABLE_VLM = True # set to False on low-resource machines: image searches then run on CLIP only
 
 CURRENT_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 DATABASE_PATH = CURRENT_DIR.parent / "preprocessing" / "rma_artworks"
 
-MAX_INDEX_IMAGES = 1500 # safeguard
-
-RETRIEVAL_TOP_K = 7
+RETRIEVAL_TOP_K = 20 # max number of records the answer LLM reads in detail (scale up with bigger models)
 VECTOR_SEARCH_K = 15
+MAX_RESULT_ROWS_DISPLAY = 2000 # rows shown in the 'All matches' table; the CSV export always contains all of them
 
-VECTOR_SIMILARITY_THRESHOLD = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
+# Text -> image and image -> image CLIP similarities live on very different scales, so each mode gets its own threshold
+VECTOR_SIMILARITY_THRESHOLD_TEXT = 0.24 # Minimum cosine similarity to drop weak matches before RRF pollution
+VECTOR_SIMILARITY_THRESHOLD_IMAGE = 0.60 # Image -> image scores run much higher; tune using the scores in the trace
+
+# Column names in the database (the script stops at startup and lists the real names if one is wrong)
+OBJECT_NUMBER_COLUMN = "objectInventoryNumber"
+HANDLE_COLUMN = "objectPersistentIdentifier"
+TITLE_COLUMN = "objectTitle[1]"
+TYPE_COLUMN = "objectType[1]"
+CREATOR_COLUMN = "objectCreator[1]"
+DATE_COLUMN = "objectCreationDate[1]"
+IMAGE_COLUMN = "objectImage"
+
+# Fields the answer LLM reads per artwork, with short labels (fewer tokens, easier for small models)
+CONTEXT_FIELDS = [(TITLE_COLUMN, "title"), (TYPE_COLUMN, "object type"), (CREATOR_COLUMN, "creator"),
+                  (DATE_COLUMN, "creation date")]
+PLAUSIBLE_YEARS = (1400, 2030) # creation dates outside this range are flagged in the profile as likely data errors
 
 
 # 1. DATABASE SETUP & SCHEMA EXTRACTION
 
 def connect_and_get_schema(db_path: Path):
     """
-    Connects to SQLite database, detects existing tables,
+    Connects to SQLite database (read-only), detects existing tables,
     and constructs a readable schema string for Text-to-SQL prompting
     """
 
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    # sqlite3.connect silently creates an empty database for a missing path, so check first
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+
+    # mode=ro: no generated query can modify the database, whatever the LLM writes
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     cursor = conn.cursor()
 
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
@@ -66,69 +88,106 @@ def connect_and_get_schema(db_path: Path):
 
     for table_name in tables:
         cursor.execute(f"PRAGMA table_info('{table_name}');")
-        columns = [f"{col_info[1]} ({col_info[2]})" for col_info in cursor.fetchall()]
-        db_schema[table_name] = columns
+        db_schema[table_name] = [(col_info[1], col_info[2]) for col_info in cursor.fetchall()]
 
-    schema_str = "".join(f"Table: {t}\nColumns: {', '.join(cols)}\n\n" for t, cols in db_schema.items())
+    # Stop early with a clear message if a configured column name doesn't exist
+    columns = [name for name, _ in db_schema[main_table]]
+    missing = [c for c in (OBJECT_NUMBER_COLUMN, HANDLE_COLUMN, TITLE_COLUMN, TYPE_COLUMN, CREATOR_COLUMN,
+                           DATE_COLUMN, IMAGE_COLUMN) if c not in columns]
+    if missing:
+        raise ValueError(f"Column(s) {missing} not found in '{main_table}'. Available columns: {columns}. "
+                         f"Set the right names in section 0.")
 
-    print(f"[Database] Connected to '{db_path}'. Primary table detected: '{main_table}'")
+    schema_str = "".join(f"Table: {t}\nColumns: {', '.join(f'{n} ({typ})' for n, typ in cols)}\n\n"
+                         for t, cols in db_schema.items())
+
+    print(f"[Database] Connected to '{db_path}' (read-only). Primary table detected: '{main_table}'")
     return conn, main_table, schema_str
 
 conn, MAIN_TABLE, SCHEMA_STR = connect_and_get_schema(DATABASE_PATH)
 
-def _find_image_column(db_conn: sqlite3.Connection, table_name: str) -> Optional[str]:
-    cursor = db_conn.cursor()
-    cursor.execute(f"PRAGMA table_info('{table_name}');")
-    columns = [c[1] for c in cursor.fetchall()]
-    return next((c for c in columns if "image" in c.lower() or "url" in c.lower()), None)
-
-IMAGE_COLUMN = _find_image_column(conn, MAIN_TABLE)
-
 
 # 2. SYSTEM PROMPTS
+
+SQL_RULES = """CRITICAL RULES:
+1. Scope: the database covers all periods, but this tool is built for early modern prints and drawings. Always filter
+   "objectCreationDate[1]" BETWEEN '1450' AND '1850', or a narrower period if the question asks for one
+   (e.g. 'after 1575' -> BETWEEN '1576' AND '1850'). Only use other years if the question explicitly asks for them.
+2. Use EXACT column names with brackets, e.g. "objectType[1]", "objectCreator[1]", "objectCreationDate[1]".
+3. The database uses Dutch terms. Translate English search terms into Dutch for LIKE clauses.
+   Examples: 'print' -> 'prent', 'drawing' -> 'tekening', 'landscape' -> 'landschap', 'portrait' -> 'portret'.
+   Subjects can only be found through the Dutch title, and titles vary, so combine several Dutch terms with OR
+   inside parentheses, e.g. landscape -> ("objectTitle[1]" LIKE '%landschap%' OR "objectTitle[1]" LIKE '%zicht%').
+4. Creator names are stored as 'Lastname, Firstname' (e.g. 'Cort, Cornelis'). Never match a full name as one string.
+   Instead: WHERE "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%'
+   Unattributed works have the creator 'anonymous'.
+5. If the question includes a visual description (from an uploaded image) rather than explicit search terms,
+   infer plausible object type / subject / period filters from it the same way you would from a text question.
+"""
 
 SQL_FILTER_SYS = f"""You are an expert AI assistant that translates natural language questions into executable SQLite SQL queries.
 
 Database schema:
 {SCHEMA_STR}
 
-CRITICAL RULES:
-1. Scope: the database only contains early modern prints and drawings. Filter using "objectType[1]" and "objectCreationDate[1]" where relevant.
-2. Use EXACT column names with brackets, e.g. "objectType[1]", "objectCreator[1]", "objectCreationDate[1]".
-3. The database uses Dutch terms. Translate English search terms into Dutch for LIKE clauses.
-   Examples: 'print' -> 'prent', 'drawing' -> 'tekening', 'landscape' -> 'landschap', 'portrait' -> 'portret'.
-4. Creator names are stored as 'Lastname, Firstname' (e.g. 'Cort, Cornelis'). Never match a full name as one string.
-   Instead: WHERE "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%'
-5. If the question includes a visual description (from an uploaded image) rather than explicit search terms,
-   infer plausible object type / subject / period filters from it the same way you would from a text question.
-
+{SQL_RULES}
 FEW-SHOT EXAMPLES:
 
 Question: Which prints were produced by Cornelis Cort?
-SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%' AND "objectCreationDate[1]" BETWEEN '1450' AND '1850'
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%' AND "objectCreationDate[1]" BETWEEN '1450' AND '1850';
 
 Question: Show me drawings of landscapes from the 16th century
-SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%tekening%' AND "objectTitle[1]" LIKE '%landschap%' AND "objectCreationDate[1]" BETWEEN '1501' AND '1600'
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%tekening%' AND ("objectTitle[1]" LIKE '%landschap%' OR "objectTitle[1]" LIKE '%zicht%') AND "objectCreationDate[1]" BETWEEN '1501' AND '1600';
 
-Question: Show me 17th century portraits
-SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectTitle[1]" LIKE '%portret%' AND "objectCreationDate[1]" BETWEEN '1601' AND '1700'
+Question: Show me 17th century portrait prints
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectTitle[1]" LIKE '%portret%' AND "objectCreationDate[1]" BETWEEN '1601' AND '1700';
 
-Return ONLY the raw SQL query, nothing else."""
+Return ONLY the raw SQL query ending with a semicolon, nothing else."""
+
+# Refining edits the previous query instead of writing a new one, so earlier conditions (e.g. the creator) are kept
+REFINE_SQL_SYS = f"""You are an expert AI assistant that edits executable SQLite SQL queries.
+Change the previous query as little as possible: keep ALL its conditions and only add or adjust what the
+refinement asks for.
+
+Database schema:
+{SCHEMA_STR}
+
+{SQL_RULES}
+FEW-SHOT EXAMPLES:
+
+Previous SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%' AND "objectCreationDate[1]" BETWEEN '1450' AND '1850';
+Refinement: Only give those after 1575
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%' AND "objectCreationDate[1]" BETWEEN '1576' AND '1850';
+
+Previous SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreationDate[1]" BETWEEN '1601' AND '1700';
+Refinement: only the portraits
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreationDate[1]" BETWEEN '1601' AND '1700' AND "objectTitle[1]" LIKE '%portret%';
+
+Return ONLY the complete refined SQL query ending with a semicolon, nothing else."""
 
 SYNTHESIS_SYS_TEMPLATE = """You are an expert art historian assisting a researcher in exploring the Rijksmuseum's
 early modern print and drawing collection.
 
 You are given a set of retrieved artwork records as context. Use ONLY this context and the
-conversation so far — do not invent facts that are not present in it.
+conversation so far — do not invent facts that are not present in it. You see catalogue metadata
+(title, object type, creator, creation date), not the images themselves.
+
+For a NEW question, answer in this structure:
+1. Answer: 1-3 sentences that answer the question directly. Take every number, date range or
+   distribution about the whole result set from the exact facts about all matches, never from
+   counting the records in the context.
+2. Observations: 2-4 points about the records in the context (themes, series, chronology, contrasts,
+   outliers), each starting with the artwork it is based on, e.g. "Artwork #4 (1559): ...".
+3. Limits: 1-2 sentences on what these records cannot show (e.g. metadata only, or only a sample).
+For a FOLLOW-UP question, answer it directly without this structure, but still cite every claim as "Artwork #N".
 
 Guidelines:
-- Ground every claim in a specific artwork from the context (reference it as "Artwork #N").
-- You do NOT need to describe every artwork in a fixed order. Prioritize what is analytically
-  interesting: patterns, contrasts, outliers, likely attributions, stylistic or thematic links.
-- If the researcher asks a follow-up question, answer it directly using the same context and
-  the conversation history — you don't need to re-summarize everything from scratch.
 - If the context doesn't contain enough information to answer confidently, say so explicitly
   rather than guessing.
+- If a question concerns records that are not in the context (e.g. a subset of all matches),
+  say that a refined or new search is needed instead of answering from the context.
+- A date in a title usually refers to the depicted event or place, not to when the object was made
+  (e.g. a battle of 1693 in a print made in 1702); use the creation date for the object itself.
 - Write for a researcher: precise, willing to flag uncertainty, comfortable making a reasoned
   comparative judgment rather than only describing.
 
@@ -140,12 +199,13 @@ Database Context (retrieved artworks for this session):
 # 3. LLM SETUP
 
 print(f"[LLM] Loading {LLM_MODEL_NAME}...")
+# 4-bit quantization (bitsandbytes) needs a CUDA GPU; on CPU the model loads unquantized
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=True,
-)
+) if torch.cuda.is_available() else None
 tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
 llm_model = AutoModelForCausalLM.from_pretrained(
     LLM_MODEL_NAME,
@@ -160,7 +220,10 @@ print(f"[LLM] {LLM_MODEL_NAME} loaded!")
 
 
 def generate_chat(messages:list, max_new_tokens: int = 500, temperature: float = 0.0,
-                  top_p: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.1) -> str:
+                  top_p: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.0,
+                  stop_strings: Optional[list] = None) -> str:
+    # Note: repetition_penalty also penalizes every token already in the PROMPT (schema, context),
+    # so tasks that must copy from the prompt (SQL) keep it at 1.0
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length)
     device = next(llm_model.parameters()).device
@@ -172,6 +235,7 @@ def generate_chat(messages:list, max_new_tokens: int = 500, temperature: float =
         do_sample=do_sample,
         max_new_tokens=max_new_tokens,
         repetition_penalty=repetition_penalty,
+        stop_strings=stop_strings,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -179,8 +243,14 @@ def generate_chat(messages:list, max_new_tokens: int = 500, temperature: float =
         gen_cfg.temperature = temperature
         gen_cfg.top_p = top_p
         gen_cfg.top_k = top_k
+    else:
+        # Greedy decoding: clear the sampling settings, otherwise the model's own defaults are merged in
+        # and transformers warns that they are ignored
+        gen_cfg.temperature = gen_cfg.top_p = gen_cfg.top_k = None
 
-    output_ids = llm_model.generate(input_ids, attention_mask=attention_mask, generation_config=gen_cfg)
+    # The tokenizer is passed so generate() can detect stop_strings
+    output_ids = llm_model.generate(input_ids, attention_mask=attention_mask, generation_config=gen_cfg,
+                                    tokenizer=tokenizer)
     return tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
 
 
@@ -188,17 +258,20 @@ def generate_chat(messages:list, max_new_tokens: int = 500, temperature: float =
 
 vlm_processor = None
 vlm_model = None
-try:
-    print(f"[VLM] Loading Vision Language Model ({VLM_MODEL_NAME})...")
-    vlm_processor = AutoProcessor.from_pretrained(VLM_MODEL_NAME)
-    vlm_model = AutoModelForImageTextToText.from_pretrained(
-        VLM_MODEL_NAME,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto"
-    )
-    print(f"[VLM] {VLM_MODEL_NAME} loaded successfully!")
-except Exception as vlm_err:
-    print(f"[VLM Warning] Could not load VLM: {vlm_err}")
+if ENABLE_VLM:
+    try:
+        print(f"[VLM] Loading Vision Language Model ({VLM_MODEL_NAME})...")
+        vlm_processor = AutoProcessor.from_pretrained(VLM_MODEL_NAME)
+        vlm_model = AutoModelForImageTextToText.from_pretrained(
+            VLM_MODEL_NAME,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto"
+        )
+        print(f"[VLM] {VLM_MODEL_NAME} loaded successfully!")
+    except Exception as vlm_err:
+        print(f"[VLM Warning] Could not load VLM: {vlm_err}")
+else:
+    print("[VLM] Disabled in the configuration (ENABLE_VLM = False).")
 
 
 def analyze_image(user_image: Image.Image) -> str:
@@ -253,79 +326,65 @@ def analyze_image(user_image: Image.Image) -> str:
             return ""
 
 
+
 # 5. CLIP EMBEDDINGS + FAISS INDEX
+# The index is built with the Colab notebook (build_faiss_index_colab.ipynb), not by this script
 
 print(f"[Embeddings] Loading CLIP model ({CLIP_MODEL_NAME})...")
 embedding_model = SentenceTransformer(CLIP_MODEL_NAME)
 
-def build_or_load_faiss_index(db_conn, table_name, image_col, embed_model, max_images=MAX_INDEX_IMAGES):
+INDEX_FILE = CURRENT_DIR / "artworks.index"
+ROW_IDS_FILE = CURRENT_DIR / "row_ids.npy"
+MANIFEST_FILE = CURRENT_DIR / "index_manifest.json"
+
+def records_fingerprint(db_conn, table_name: str, where_sql: str, image_col: str) -> str:
     """
-    Checks if FAISS vector index exists. If missing, automatically extracts image URLs from early modern prints
-    and drawings (up to max_images), downloads images, and builds the FAISS index using GPU if available
+    SHA-256 over (rowid, image URL) of all records the index should contain. The build notebook runs the
+    same code, so equal fingerprints mean the index's row ids point to the same records and images
     """
 
-    index_file = CURRENT_DIR / "artworks.index"
-    row_ids_file = CURRENT_DIR / "row_ids.npy"
+    h = hashlib.sha256()
+    for rid, url in db_conn.execute(f'SELECT rowid, "{image_col}" FROM {table_name} WHERE {where_sql} ORDER BY rowid'):
+        h.update(f"{rid}|{url}\n".encode("utf-8"))
+    return h.hexdigest()
 
-    if index_file.exists() and row_ids_file.exists():
-        print(f"[FAISS] Found existing index files: '{index_file.name}' and '{row_ids_file.name}'. Loading...")
-        return faiss.read_index(str(index_file)), np.load(str(row_ids_file))
+def load_faiss_index(db_conn, embed_model):
+    """
+    Loads the FAISS index, but only if its manifest proves it belongs to THIS database and CLIP model.
+    Otherwise visual search is disabled (with the reason) instead of silently returning wrong artworks
+    Returns (index, row_ids, status message)
+    """
 
-    if image_col is None:
-        print("[FAISS] No image column available - return empty index...")
-        return faiss.IndexFlatIP(512), np.array([], dtype=int)
+    dim = len(embed_model.encode("dimension check")) # 512 for ViT-B/32, 768 for ViT-L/14
+    empty = (faiss.IndexFlatIP(dim), np.array([], dtype=int))
 
-    print(f"[FAISS] Starting automatic image embedding for early modern prints/drawings (Limited to max {max_images} images for testing)...")
-    cursor = db_conn.cursor()
-    query = f"""
-            SELECT rowid, {image_col} 
-            FROM {table_name} 
-            WHERE ("objectType[1]" LIKE '%prent%' OR "objectType[1]" LIKE '%tekening%')
-              AND "objectCreationDate[1]" BETWEEN '1450' AND '1850'
-              AND {image_col} IS NOT NULL AND {image_col} != '<null>' AND {image_col} != '' 
-            LIMIT {max_images}
-        """
-    cursor.execute(query)
-    records = cursor.fetchall()
-    print(f"[FAISS] Found {len(records)} image records to process.")
+    if not (INDEX_FILE.exists() and ROW_IDS_FILE.exists() and MANIFEST_FILE.exists()):
+        return (*empty, f"Visual search disabled: no complete index in '{CURRENT_DIR.resolve()}' (expected "
+                        f"artworks.index, row_ids.npy and index_manifest.json from the Colab notebook).")
+    manifest = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+    if manifest["clip_model"] != CLIP_MODEL_NAME:
+        return (*empty, f"Visual search disabled: the index was built with {manifest['clip_model']}, "
+                        f"but CLIP_MODEL_NAME is {CLIP_MODEL_NAME}.")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    embed_model.to(device)
-    print(f"[FAISS] Running embedding model on device: {device.upper()}")
+    print("[FAISS] Checking that the index matches this database...")
+    fingerprint = records_fingerprint(db_conn, manifest["table"], manifest["eligibility_where"],
+                                      manifest["image_column"])
+    if fingerprint != manifest["records_fingerprint"]:
+        return (*empty, "Visual search disabled: the index was built from a different version of the database. "
+                        "Rebuild it with the Colab notebook.")
 
-    embeddings, valid_row_ids = [], []
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    index = faiss.read_index(str(INDEX_FILE))
+    row_ids = np.load(str(ROW_IDS_FILE))
+    if index.ntotal != len(row_ids) or index.ntotal != manifest["n_vectors"] or index.d != dim:
+        return (*empty, "Visual search disabled: the index files are incomplete or don't belong together.")
 
-    for i, (row_id, img_url) in enumerate(records):
-        try:
-            if isinstance(img_url, str) and img_url.startswith("http"):
-                res = requests.get(img_url, timeout=5, headers=headers)
-                if res.status_code == 200:
-                    img = Image.open(io.BytesIO(res.content)).convert("RGB")
-                    embeddings.append(embed_model.encode(img, convert_to_numpy=True))
-                    valid_row_ids.append(row_id)
-        except Exception as err:
-            pass
-        if (i + 1) % 100 == 0:
-            print(f"  ... processed {i + 1}/{len(records)}")
-
-    if not embeddings:
-        print("[FAISS Warning] No images embedded. Returning empty index.")
-        return faiss.IndexFlatIP(512), np.array([], dtype=int)
-
-    embeddings_np = np.array(embeddings, dtype="float32")
-    faiss.normalize_L2(embeddings_np)
-    index = faiss.IndexFlatIP(embeddings_np.shape[1])
-    index.add(embeddings_np)
-    row_ids_np = np.array(valid_row_ids, dtype=int)
-
-    faiss.write_index(index, str(index_file))
-    np.save(str(row_ids_file), row_ids_np)
-    print(f"[FAISS] Index built with {len(valid_row_ids)} vectors.")
-    return index, row_ids_np
+    status = (f"Visual index verified: {index.ntotal:,} of {manifest['n_eligible']:,} eligible prints and drawings "
+              f"({manifest['n_failed']:,} images could not be downloaded), built {manifest['built_at']}.")
+    return index, row_ids, status
 
 
-faiss_index, faiss_row_ids = build_or_load_faiss_index(conn, MAIN_TABLE, IMAGE_COLUMN, embedding_model)
+faiss_index, faiss_row_ids, INDEX_STATUS = load_faiss_index(conn, embedding_model)
+print(f"[FAISS] {INDEX_STATUS}")
 
 
 # 6. RECIPROCAL RANK FUSION (RRF)
@@ -350,41 +409,64 @@ def reciprocal_rank_fusion(sql_ids: list, vector_ids: list, k: int = 60, top_n: 
 # 7. PROTOTYPE ENGINE
 
 DANGEROUS_KEYWORDS = ["drop", "delete", "update", "insert", "alter", "create", "truncate", "attach", "pragma"]
+# Word boundaries (\b) so that e.g. a creator named 'Walter' doesn't trigger 'alter'
+DANGEROUS_PATTERN = re.compile(r"\b(" + "|".join(DANGEROUS_KEYWORDS) + r")\b", re.IGNORECASE)
+
+
+def _preview_ids(ids: list, n: int = 50) -> str:
+    """
+    Shortens long rowid lists for the trace
+    """
+    return str(ids) if len(ids) <= n else f"{ids[:n]} ... (+{len(ids) - n} more)"
+
+
+def _is_filled(value) -> bool:
+    return pd.notna(value) and str(value).strip() not in ("", "<null>")
+
 
 class ResearchEngine:
     """
-    Holds retrieval state (current context) and conversation history separately,
+    Holds retrieval state (current results) and conversation history separately,
     so a follow-up question can reason over the same retrieved artworks without
     re-running SQL/vector search, and a "new search" explicitly resets both
+
+    Results are kept at two levels:
+    - self.results: ALL records that matched (the 'All matches' table, the profile and the CSV export)
+    - self.context_df: the sample of those records the answer LLM reads in detail ("Artwork #1" ...)
     """
 
-    def __init__(self, db_conn, table_name, image_col, faiss_idx, row_ids_arr, embed_model):
+    def __init__(self, db_conn, table_name, faiss_idx, row_ids_arr, embed_model):
         self.db_conn = db_conn
         self.table_name = table_name
-        self.image_col = image_col
         self.faiss_index = faiss_idx
         self.row_ids = row_ids_arr
         self.embed_model = embed_model
 
+        # rowid -> position in the FAISS index, so any set of rows (e.g. SQL hits) can be scored directly
+        self.rowid_to_pos = {int(r): i for i, r in enumerate(row_ids_arr)}
+
         # Retrieval state (persists across follow-up turns)
-        self.current_context_str = ""
-        self.current_hybrid_ids = []
-        self.current_image_urls = []
-        self.last_sql_query = ""
-        self.last_vector_ids = []
-        self.last_vector_scores = {}
-        self.current_source_map = {}
+        self.results = pd.DataFrame()
+        self.context_df = pd.DataFrame()
+        self.context_str = ""
+        self.images = []
+        self.profile = ""
+        self.ranking_note = "" # how the sample was chosen; told to the answer LLM
+
+        # Kept so refinements and edited SQL can build on the last search without re-running CLIP
+        self.last_sql = ""
+        self.last_sql_ids = []
+        self.last_question = ""
+        self.last_vector_hits = []
+        self.last_query_vec = None
+        self.last_search_was_image = False
 
         # The VLM caption of the uploaded image (if any) is kept for the whole retrieval
         # session so follow-ups and SQL re-runs still "remember" what the image looked like.
-        self.current_image_analysis = ""
-        # True if the last search was driven by an uploaded image; controls whether vector
-        # hits are unioned with SQL hits (image mode) or restricted to them (text mode).
-        self.last_search_was_image = False
+        self.image_analysis = ""
 
         # Structured, per-query trace: every retrieval step gets logged here AND printed
         self._trace_buffer = []
-        self.last_trace = ""
 
         # Conversation state (persists across follow-up turns, reset on new search)
         self.history = []  # list of {"role": "user"/"assistant", "content": str}
@@ -400,10 +482,6 @@ class ResearchEngine:
     def _trace(self, line: str):
         print(line)
         self._trace_buffer.append(line)
-
-    def _trace_finalize(self) -> str:
-        self.last_trace = "\n".join(self._trace_buffer)
-        return self.last_trace
 
     # SQL
 
@@ -425,7 +503,7 @@ class ResearchEngine:
             )},
             {"role": "user", "content": caption},
         ]
-        hints = generate_chat(messages, max_new_tokens=15, temperature=0.0)
+        hints = generate_chat(messages, max_new_tokens=15)
         return hints.strip().splitlines()[0][:60] if hints.strip() else ""
 
     def generate_sql(self, natural_language_query: str) -> str:
@@ -433,135 +511,309 @@ class ResearchEngine:
             {"role": "system", "content": SQL_FILTER_SYS},
             {"role": "user", "content": f"Question: {natural_language_query}\nSQL query:"},
         ]
-        raw_sql = generate_chat(messages, max_new_tokens=250, temperature=0.0)
+        # Looping is prevented by stopping at the first ';' (not by a repetition penalty, see generate_chat)
+        return self._clean_sql(generate_chat(messages, max_new_tokens=250, stop_strings=[";"]))
+
+    def refine_sql(self, previous_sql: str, instruction: str) -> str:
+        messages = [
+            {"role": "system", "content": REFINE_SQL_SYS},
+            {"role": "user", "content": f"Previous SQL: {previous_sql};\nRefinement: {instruction}\nSQL:"},
+        ]
+        return self._clean_sql(generate_chat(messages, max_new_tokens=300, stop_strings=[";"]))
+
+    @staticmethod
+    def _clean_sql(raw_sql: str) -> str:
         clean_sql = re.sub(r"```sql\s*|```|^(sql query:|sql:)\s*", "", raw_sql, flags=re.IGNORECASE).strip()
-        return clean_sql
+        # Keep only the first statement (small models sometimes continue after the query)
+        return clean_sql.split(";")[0].strip()
 
-    def run_sql(self, sql_text: str) -> list:
+    def run_sql(self, sql_text: str):
+        """
+        Returns (rowids, sql_for_ids); sql_for_ids is the rowid-only query, reused as a subquery
+        to load the full result set
+        """
+
+        sql_text = sql_text.split(";")[0].strip()
         lowered = sql_text.lower()
-        if any(word in lowered for word in DANGEROUS_KEYWORDS):
+        if DANGEROUS_PATTERN.search(lowered):
             raise ValueError("Query rejected: contains a disallowed keyword.")
-        if not lowered.strip().startswith("select"):
+        if not lowered.startswith("select"):
             raise ValueError("Query rejected: only SELECT statements are allowed.")
+        if not re.search(r"(?i)\bFROM\b", sql_text):
+            raise ValueError("Query rejected: no FROM clause.")
 
-        if re.search(r"(?i)\bFROM\b", sql_text):
-            sql_for_ids = re.sub(r"(?i)^SELECT\s+.*?\s+FROM\s+\S+", f"SELECT rowid FROM {self.table_name}", sql_text)
-        else:
-            sql_for_ids = f"SELECT rowid FROM {self.table_name} WHERE {sql_text}"
+        # Whatever the query selects, only rowids are needed (?s = DOTALL, the SELECT list may span lines)
+        sql_for_ids = re.sub(r"(?is)^SELECT\s+.*?\s+FROM\s+\S+", f"SELECT rowid FROM {self.table_name}",
+                             sql_text, count=1)
 
         cursor = self.db_conn.cursor()
         cursor.execute(sql_for_ids)
-        return [int(r[0]) for r in cursor.fetchall() if r[0] is not None]
+        return [int(r[0]) for r in cursor.fetchall() if r[0] is not None], sql_for_ids
 
     #  Vector search
 
-    def vector_search(self, text: Optional[str] = None, image: Optional[Image.Image] = None,
-                      k: int = VECTOR_SEARCH_K, threshold: float = VECTOR_SIMILARITY_THRESHOLD) -> list:
+    def encode_query(self, text: Optional[str] = None, image: Optional[Image.Image] = None) -> Optional[np.ndarray]:
         """
-        Returns a list of pairs (rowID, score), filtered by the threshold; image takes priority over text,
-        CLIP embeds one query vector per call
+        Embeds the query with CLIP into one L2-normalized (1, dim) vector; image takes priority over text
         """
 
-        if self.faiss_index.ntotal == 0 or len(self.row_ids) == 0:
-            return []
         if image is not None:
-            vec = self.embed_model.encode(image).astype("float32")
+            vec = self.embed_model.encode(image)
         elif text:
-            vec = self.embed_model.encode(text).astype("float32")
+            vec = self.embed_model.encode(text)
         else:
-            return []
-        if vec.ndim == 1:
-            vec = np.expand_dims(vec, axis=0)
+            return None
+        vec = np.ascontiguousarray(vec, dtype="float32").reshape(1, -1)
         faiss.normalize_L2(vec)
-        scores, indices = self.faiss_index.search(vec, k)
+        return vec
 
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1 or idx >= len(self.row_ids):
-                continue
-            if score < threshold:
-                continue
-            results.append((int(self.row_ids[idx]), float(score)))
-        return results
-
-
-    # Context fetching
-
-    def fetch_context(self, hybrid_ids: list, source_map: Optional[dict] = None):
+    def vector_search(self, query_vec: np.ndarray, threshold: float) -> list:
         """
-        Returns (context_str, image_urls, dataframe) for the given rowids, in rank order
-        source_map = maps rowid so results table can show why each row was retrieved
+        Returns (rowID, score) pairs from the whole index, above the threshold
         """
 
-        if not hybrid_ids:
-            return "", [], pd.DataFrame()
-        source_map = source_map or {}
+        scores, indices = self.faiss_index.search(query_vec, VECTOR_SEARCH_K)
+        return [(int(self.row_ids[idx]), float(score)) for score, idx in zip(scores[0], indices[0])
+                if idx != -1 and score >= threshold]
 
-        cursor = self.db_conn.cursor()
-        placeholders = ",".join("?" for _ in hybrid_ids)
-        cursor.execute(f"SELECT rowid, * FROM {self.table_name} WHERE rowid IN ({placeholders})", hybrid_ids)
-        raw_rows = cursor.fetchall()
-        columns = [d[0] for d in cursor.description][1:]
-        row_dict = {r[0]: r[1:] for r in raw_rows}
+    def score_candidates(self, query_vec: np.ndarray, candidate_ids: list) -> list:
+        """
+        Cosine similarity between the query and specific rows (index vectors are already L2-normalized)
+        Used to rank SQL hits, instead of intersecting them with CLIP's global top-k
+        Returns (rowID, score) pairs sorted by score; rows without an indexed image are left out
+        """
 
-        context_parts, image_urls, table_rows = [], [], []
-        for idx, rid in enumerate(hybrid_ids, start=1):
-            if rid not in row_dict:
-                continue
-            row = row_dict[rid]
-            details = [f"{c}: {v}" for c, v in zip(columns, row) if v and str(v).strip()]
-            context_parts.append(f"[Artwork #{idx} - ID {rid}] " + " | ".join(details))
+        pairs = [(rid, self.rowid_to_pos[rid]) for rid in candidate_ids if rid in self.rowid_to_pos]
+        if not pairs:
+            return []
+        vecs = self.faiss_index.reconstruct_batch(np.array([pos for _, pos in pairs], dtype="int64"))
+        sims = vecs @ query_vec.ravel()
+        return sorted(zip([rid for rid, _ in pairs], sims.tolist()), key=lambda x: x[1], reverse=True)
 
-            src = source_map.get(rid, {})
-            found_via = "+".join(filter(None, ["SQL" if src.get("sql") else "", "Vector" if src.get("vector") else ""])) or "?"
-            table_rows.append({
-                "Artwork #": idx,
-                "rowid": rid,
-                "found_via": found_via,
-                "vector_similarity": round(src["vector_score"], 3) if src.get("vector_score") is not None else "",
-                **{c: v for c, v in zip(columns, row)},
-                              })
+    # Results: ranking, sample, profile, context
 
-            for c, v in zip(columns, row):
-                if self.image_col and c == self.image_col and isinstance(v, str) and v.startswith("http"):
-                    image_urls.append(v)
-                    break
+    def load_records(self, sql_for_ids: str, extra_ids: list) -> pd.DataFrame:
+        """
+        ALL records of the result set in one DataFrame: the SQL matches (the SQL query is used as a
+        subquery, so their number doesn't matter) plus extra rowids from the vector search
+        """
 
-        df = pd.DataFrame(table_rows)
-        return "\n\n".join(context_parts), image_urls, df
+        parts = []
+        if sql_for_ids:
+            parts.append(pd.read_sql_query(
+                f"SELECT rowid AS rowid, * FROM {self.table_name} WHERE rowid IN ({sql_for_ids})", self.db_conn))
+        if extra_ids:
+            placeholders = ",".join("?" for _ in extra_ids)
+            parts.append(pd.read_sql_query(
+                f"SELECT rowid AS rowid, * FROM {self.table_name} WHERE rowid IN ({placeholders})",
+                self.db_conn, params=extra_ids))
+        if not parts:
+            return pd.DataFrame()
+        df = pd.concat(parts).drop_duplicates("rowid")
+        df["year"] = pd.to_numeric(df[DATE_COLUMN], errors="coerce") # numeric copy for sorting and the profile
+        return df.sort_values(["year", "rowid"]).reset_index(drop=True)
+
+    @staticmethod
+    def chronological_sample(results: pd.DataFrame, k: int = RETRIEVAL_TOP_K) -> list:
+        """
+        Evenly spaced picks from ALL matches in chronological order, so the sample mirrors the date
+        distribution of the full result set
+        """
+
+        ordered = results["rowid"].tolist() # load_records already sorted them by year
+        if len(ordered) <= k:
+            return ordered
+        step = len(ordered) / k
+        return [ordered[int((i + 0.5) * step)] for i in range(k)] # the middle of each of the k slices
+
+    def build_profile(self, results: pd.DataFrame) -> str:
+        """
+        Exact facts about ALL matches (not just the sample). Shown to the researcher and given to the
+        answer LLM, so statements about the whole result set don't depend on the sample
+        """
+
+        n = len(results)
+        lines = [f"Total matches: {n}",
+                 f"Distinct titles: {results[TITLE_COLUMN].nunique()} (records with the same title can be several "
+                 f"impressions, states or parts of one print)"]
+
+        lo, hi = PLAUSIBLE_YEARS
+        years = results["year"]
+        plausible = years.between(lo, hi)
+        if plausible.any():
+            first, last = int(years[plausible].min()), int(years[plausible].max())
+            bin_size = 10 if last - first <= 100 else 25 if last - first <= 250 else 50
+            periods = (years[plausible] // bin_size * bin_size).astype(int).value_counts().sort_index()
+            lines.append(f"Creation dates: {first}-{last}")
+            lines.append(f"Per {bin_size} years: " + ", ".join(
+                f"{p}-{p + bin_size - 1}: {c}" for p, c in periods.items()))
+        n_odd = int((~plausible).sum())
+        if n_odd:
+            odd = results.loc[~plausible, [OBJECT_NUMBER_COLUMN, DATE_COLUMN]].head(10)
+            lines.append(f"Missing or implausible creation dates (outside {lo}-{hi}, likely data errors): {n_odd} - "
+                         f"e.g. " + "; ".join(f"{o}: {d!r}" for o, d in odd.itertuples(index=False)))
+
+        lines.append("Object types: " + "; ".join(
+            f"{t} ({c})" for t, c in results[TYPE_COLUMN].value_counts().head(10).items()))
+        lines.append("Most frequent creators (top 10): " + "; ".join(
+            f"{t} ({c})" for t, c in results[CREATOR_COLUMN].value_counts().head(10).items()))
+        n_image = int(results[IMAGE_COLUMN].astype(str).str.startswith("http").sum())
+        n_indexed = int(results["rowid"].isin(list(self.rowid_to_pos)).sum())
+        lines.append(f"With an image: {n_image} of {n}")
+        lines.append(f"In the visual (CLIP) index: {n_indexed} of {n} "
+                     f"(only these can be ranked or found by visual similarity)")
+        return "\n".join(lines)
+
+    def retrieve(self, sql_ids: list, sql_for_ids: str, vector_hits: list, image_mode: bool,
+                 query_vec: Optional[np.ndarray]):
+        """
+        Builds the full result set, chooses the sample the LLM reads and prepares its context.
+        SQL returns rows in rowid order, which says nothing about relevance, so:
+        - Text mode, SQL found rows: SQL filters. CLIP ranks them if there is a query vector;
+          otherwise the sample is a chronological spread over ALL matches
+        - Text mode, SQL found nothing: CLIP's global hits
+        - Image mode: SQL hits (ranked by similarity to the image) and CLIP's global hits, fused with RRF
+        """
+
+        if sql_ids and not image_mode:
+            vector_hits = [] # in text mode CLIP only ranks SQL hits, it doesn't add records
+        vector_ids = [rid for rid, _ in vector_hits]
+        scores = dict(vector_hits)
+
+        if sql_ids and query_vec is not None:
+            ranked = self.score_candidates(query_vec, sql_ids)
+            scores.update(ranked)
+            ranked_ids = [rid for rid, _ in ranked]
+            sql_ids = ranked_ids + [rid for rid in sql_ids if rid not in set(ranked_ids)]
+            self._trace(f"[Rank] Re-ranked {len(ranked)} SQL hit(s) by CLIP similarity to the query; "
+                        f"{len(sql_ids) - len(ranked)} without an indexed image kept at the end.")
+
+        results = self.load_records(sql_for_ids if sql_ids else "", vector_ids)
+        if results.empty:
+            self.results = self.context_df = pd.DataFrame()
+            self.context_str, self.images, self.profile, self.ranking_note = "", [], "", ""
+            return
+
+        # The sample: which records the answer LLM reads in detail, and how they were chosen
+        if image_mode or not sql_ids:
+            sample_ids = reciprocal_rank_fusion(sql_ids, vector_ids)
+            if image_mode and sql_ids:
+                self.ranking_note = "metadata matches and visually similar artworks, fused by similarity to the uploaded image"
+            elif image_mode:
+                self.ranking_note = "visual similarity to the uploaded image only"
+            else:
+                self.ranking_note = "visual similarity only (the SQL query found nothing)"
+        elif query_vec is not None:
+            sample_ids = sql_ids[:RETRIEVAL_TOP_K]
+            self.ranking_note = "the metadata matches most similar to the question (CLIP)"
+        else:
+            sample_ids = self.chronological_sample(results)
+            self.ranking_note = "records evenly spread over the chronological order of all matches"
+        self._trace(f"[Rank] Sample: {self.ranking_note}.")
+        self._trace(f"[Rank] Final selection ({len(sample_ids)} of {len(results)} artwork(s)): {sample_ids}")
+
+        # Provenance and position in the context, for both tables
+        position = {rid: n for n, rid in enumerate(sample_ids, start=1)}
+        sql_set, vector_set = set(sql_ids), set(vector_ids)
+        results.insert(0, "Artwork #", results["rowid"].map(lambda r: position.get(r, "")))
+        results.insert(1, "found_via", results["rowid"].map(
+            lambda r: "+".join(s for s, hit in (("SQL", r in sql_set), ("Vector", r in vector_set)) if hit)))
+        results.insert(2, "vector_similarity", results["rowid"].map(lambda r: round(scores[r], 3) if r in scores else ""))
+
+        self.profile = self.build_profile(results)
+        self._trace("[Profile] Exact facts about all matches:\n" + self.profile)
+        self.results = results.drop(columns="year")
+        self.context_df = (self.results[self.results["rowid"].isin(sample_ids)]
+                           .sort_values("Artwork #").reset_index(drop=True))
+
+        # Context for the LLM (object number as identifier) and captioned images for the gallery
+        context_parts, self.images = [], []
+        for _, row in self.context_df.iterrows():
+            n, obj = row["Artwork #"], row[OBJECT_NUMBER_COLUMN]
+            details = " | ".join(f"{label}: {row[col]}" for col, label in CONTEXT_FIELDS if _is_filled(row[col]))
+            context_parts.append(f"[Artwork #{n} | {obj}] {details}")
+            if str(row[IMAGE_COLUMN]).startswith("http"):
+                self.images.append((row[IMAGE_COLUMN], f"Artwork #{n} ({obj}) - {row[TITLE_COLUMN]}"))
+        self.context_str = "\n\n".join(context_parts)
 
     # Synthesis
 
     def synthesize(self, user_question: str) -> str:
-        system_content = SYNTHESIS_SYS_TEMPLATE.format(context=self.current_context_str)
-        if self.current_image_analysis:
+        """
+        Returns the answer for the UI (with a scope line and sources); the history keeps the plain answer
+        """
+
+        system_content = SYNTHESIS_SYS_TEMPLATE.format(context=self.context_str)
+        n_read, n_total = len(self.context_df), len(self.results)
+        system_content += (
+            "\nExact facts about ALL matches of the search (computed by the database; use these for any "
+            f"statement about the whole result set):\n{self.profile}\n"
+        )
+        if n_total > n_read:
+            system_content += (f"\nNote: {n_total} artworks matched, but only the {n_read} above are in your context "
+                               f"({self.ranking_note}). Do not generalize from them to the full set of matches.\n")
+        else:
+            system_content += "\nNote: the context above contains ALL artworks that matched the search.\n"
+        if self.image_analysis:
             system_content += (
                 "\nThe researcher also uploaded an image. An automatic (small-model) description "
                 "of it follows; treat it as a rough, possibly inaccurate aid, not as fact:\n"
-                f"{self.current_image_analysis}\n"
+                f"{self.image_analysis}\n"
             )
+        system_content += ("\nThis is a FOLLOW-UP question.\n" if self.history else
+                           "\nThis is a NEW question: use the Answer / Observations / Limits structure.\n")
 
         messages = [{"role": "system", "content": system_content}] + self.history
         messages.append({"role": "user", "content": user_question})
 
-        # Tweakable parameters
-        answer = generate_chat(messages, max_new_tokens=900, temperature=0.6, top_p=0.9, top_k=50)
+        # Tweakable parameters (lower temperature keeps the answer closer to the context; repetition_penalty
+        # is kept mild because it also penalizes titles and names copied from the context)
+        answer = generate_chat(messages, max_new_tokens=900, temperature=0.3, top_p=0.9, top_k=50,
+                               repetition_penalty=1.05)
 
         self.history.append({"role": "user", "content": user_question})
         self.history.append({"role": "assistant", "content": answer})
-        return answer
+        return self.attach_sources(answer)
+
+    def attach_sources(self, answer: str) -> str:
+        """
+        Adds, written by the code and not by the LLM: a scope line (what the answer is based on), the cited
+        records from the database (so every citation can be checked), and warnings for invalid or missing citations
+        """
+
+        n_read, n_total = len(self.context_df), len(self.results)
+        scope = (f"[Based on all {n_total} matching records.]" if n_read >= n_total else
+                 f"[Based on {n_read} of {n_total} matching records: {self.ranking_note}. "
+                 f"Exact figures over all matches are in the profile.]")
+
+        cited = sorted({int(n) for n in re.findall(r"Artwork #(\d+)", answer)})
+        lines = []
+        for n in cited:
+            match = self.context_df[self.context_df["Artwork #"] == n]
+            if match.empty:
+                lines.append(f"WARNING: the answer cites Artwork #{n}, which is not in the context.")
+                continue
+            row = match.iloc[0]
+            lines.append(f"Artwork #{n}: " + " | ".join(str(row[c]) for c in (
+                OBJECT_NUMBER_COLUMN, TITLE_COLUMN, CREATOR_COLUMN, DATE_COLUMN, HANDLE_COLUMN) if _is_filled(row[c])))
+        if not cited:
+            lines.append("WARNING: the answer cites no specific records; its claims are not grounded in the data.")
+        self._trace("[Check] " + ("; ".join(l for l in lines if l.startswith("WARNING")) or
+                                  "All cited artwork numbers exist in the context."))
+        return (scope + "\n\n" + answer + "\n\n---\nSources (from the database, not generated by the model):\n"
+                + "\n".join(lines))
 
     # Top-level orchestration
 
     def new_search(self, user_input: str, user_image: Optional[Image.Image] = None,
                    include_vector_for_text: bool = False, use_caption_for_sql: bool = False):
         """
-        Full pipeline: SQL + optional vector search -> RRF -> reset conversation -> synthesize
+        Full pipeline: SQL + optional vector search -> results, sample and profile -> reset conversation -> synthesize
 
         - SQL handles what the researcher TYPED (plus, optionally, condensed image hints)
 
         - CLIP finds visually similar artworks from an uploaded image (always runs in image
-          mode; opt-in for text-only queries via `include_vector_for_text`)
+          mode; opt-in for text-only queries via `include_vector_for_text`), and ranks the SQL hits
 
         - The VLM caption is a soft input for the answer LLM and a visible aid for the
           researcher. It is NOT pushed into SQL unless `use_caption_for_sql` is True, because
@@ -574,230 +826,206 @@ class ResearchEngine:
         self._trace(f"[New search] query={user_input!r}, image_uploaded={image_mode}, "
                     f"include_vector_for_text={include_vector_for_text}, use_caption_for_sql={use_caption_for_sql}")
 
-        image_analysis = analyze_image(user_image) if image_mode else ""
-        self._trace(
-            f"[VLM] {'Description: ' + image_analysis if image_analysis else '(no image uploaded, VLM skipped)'}")
+        self.image_analysis = analyze_image(user_image) if image_mode else ""
+        if image_mode:
+            self._trace(f"[VLM] Description: {self.image_analysis or '(none: VLM disabled or failed, see console)'}")
 
         sql_question = (user_input or "").strip()
-        if image_analysis and use_caption_for_sql:
-            hints = self.extract_filter_hints(image_analysis)
+        if self.image_analysis and use_caption_for_sql:
+            hints = self.extract_filter_hints(self.image_analysis)
             self._trace(f"[SQL] Experimental: condensed image hints for SQL = {hints!r}")
-            if hints:
-                sql_question = f"{sql_question} {hints}".strip()
-        elif image_analysis:
-            self._trace("[SQL] Image description is NOT used for SQL (experimental filter option is off).")
-        self._trace(f"[SQL] Question sent to LLM for translation: {sql_question!r}")
+            sql_question = f"{sql_question} {hints}".strip()
 
-        sql_query, sql_ids = "", []
+        sql, sql_ids, sql_for_ids = "", [], ""
         if sql_question:
             try:
-                sql_query = self.generate_sql(sql_question)
-                self._trace(f"[SQL] Generated SQL: {sql_query}")
-                sql_ids = self.run_sql(sql_query)
-                self._trace(f"[SQL] Matched {len(sql_ids)} row(s): {sql_ids}")
+                sql = self.generate_sql(sql_question)
+                self._trace(f"[SQL] Generated SQL: {sql}")
+                sql_ids, sql_for_ids = self.run_sql(sql)
+                self._trace(f"[SQL] Matched {len(sql_ids)} row(s): {_preview_ids(sql_ids)}")
             except Exception as e:
                 self._trace(f"[SQL Error] {e}")
         else:
             self._trace("[SQL] Skipped (no typed question: image-only search relies on CLIP).")
 
-        run_vector = image_mode or include_vector_for_text
-        if run_vector:
-            mode = "image" if image_mode else "text (opt-in)"
-            self._trace(f"[Vector] Running CLIP search, mode={mode}, threshold={VECTOR_SIMILARITY_THRESHOLD}")
-
-            vector_hits = self.vector_search(
-                text=user_input,
-                image=user_image,
-                k=VECTOR_SEARCH_K,
-                threshold=VECTOR_SIMILARITY_THRESHOLD)
-
-            if vector_hits:
-                scored = ", ".join(f"{rid}:{score:.3f}" for rid, score in vector_hits)
-                self._trace(f"[Vector] {len(vector_hits)} candidate(s) above threshold: {scored}")
-            else:
-                self._trace("[Vector] No candidates above the similarity threshold.")
-        else:
-            vector_hits = []
+        # CLIP: always for an uploaded image; for text only when requested
+        query_vec, vector_hits = None, []
+        if not (image_mode or include_vector_for_text):
             self._trace("[Vector] Skipped (text-only query, 'include visual similarity' not checked).")
-        vector_ids = [rid for rid, _ in vector_hits]
-        vector_scores = {rid: score for rid, score in vector_hits}
-
-        if sql_ids and not image_mode:
-            sql_set = set(sql_ids)
-            filtered_vector_ids = [v for v in vector_ids if v in sql_set]
-            self._trace(f"[RRF] Text mode with SQL results — vector candidates restricted to SQL's rowid set: "
-                        f"{filtered_vector_ids} (of {vector_ids})")
-            hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids)
+        elif self.faiss_index.ntotal == 0:
+            self._trace(f"[Vector] {INDEX_STATUS}")
         else:
-            if image_mode:
-                self._trace("[RRF] Image mode — SQL and vector are fused as two independent ranked lists "
-                            "(rows found by both rank highest; rows found by only one still appear).")
-            hybrid_ids = reciprocal_rank_fusion(sql_ids, vector_ids)
+            query_vec = self.encode_query(text=user_input, image=user_image)
+            # Global search in image mode, or as a fallback when the text query found nothing
+            if image_mode or not sql_ids:
+                threshold = VECTOR_SIMILARITY_THRESHOLD_IMAGE if image_mode else VECTOR_SIMILARITY_THRESHOLD_TEXT
+                vector_hits = self.vector_search(query_vec, threshold)
+                self._trace(f"[Vector] {len(vector_hits)} candidate(s) above threshold {threshold}: " +
+                            ", ".join(f"{rid}:{score:.3f}" for rid, score in vector_hits))
 
-        self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
+        self.retrieve(sql_ids, sql_for_ids, vector_hits, image_mode, query_vec)
+        self.last_sql, self.last_sql_ids = sql, sql_ids
+        self.last_vector_hits, self.last_query_vec, self.last_search_was_image = vector_hits, query_vec, image_mode
+        self.last_question = (user_input or "").strip() or (
+            "Describe the retrieved artworks and how they relate to the uploaded image." if image_mode
+            else "Describe and compare the retrieved artworks.")
+        return self._finish("new_search", user_input, self.last_question, sql)
 
-        sql_set, vector_set = set(sql_ids), set(vector_ids)
-        source_map = {
-            rid: {"sql": rid in sql_set, "vector": rid in vector_set, "vector_score": vector_scores.get(rid)}
-            for rid in hybrid_ids
-        }
+    def refine_search(self, instruction: str):
+        """
+        Narrow (or adjust) the CURRENT result set: the LLM edits the last SQL query instead of writing a new
+        one, so earlier conditions (e.g. the creator) are kept. The vector half of the last search is reused
+        """
 
-        context_str, image_urls, df = self.fetch_context(hybrid_ids, source_map)
+        if not self.last_sql:
+            return self.new_search(instruction)
 
-        # Reset retrieval + conversation state
-        self.current_context_str = context_str
-        self.current_hybrid_ids = hybrid_ids
-        self.current_image_urls = image_urls
-        self.current_source_map = source_map
-        self.last_sql_query = sql_query
-        self.last_vector_ids = vector_ids
-        self.last_vector_scores = vector_scores
-        self.current_image_analysis = image_analysis
-        self.last_search_was_image = image_mode
-        self.history = []
+        self._trace_reset()
+        self._trace(f"[Refine] instruction={instruction!r}")
+        self._trace(f"[Refine] Previous SQL: {self.last_sql}")
+        refined_sql = ""
+        try:
+            refined_sql = self.refine_sql(self.last_sql, instruction)
+            self._trace(f"[Refine] Refined SQL: {refined_sql}")
+            sql_ids, sql_for_ids = self.run_sql(refined_sql)
+            self._trace(f"[Refine] Matched {len(sql_ids)} row(s): {_preview_ids(sql_ids)}")
+        except Exception as e:
+            return self._error(f"Refined SQL rejected: {e}", refined_sql or self.last_sql)
 
-        if not hybrid_ids:
-            answer = "No artworks matched this query." + (
-                f"\n\nImage analysis:\n{image_analysis}" if image_analysis else "")
-            self.history = [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
-        else:
-            if user_input and user_input.strip():
-                question = user_input.strip()
-            elif image_mode:
-                question = "Describe the retrieved artworks and how they relate to the uploaded image."
-            else:
-                question = "Describe and compare the retrieved artworks."
-            answer = self.synthesize(question)
+        # A refinement should narrow the result set; if it doesn't, the researcher needs to know
+        previous = set(self.last_sql_ids)
+        n_outside = sum(1 for rid in sql_ids if rid not in previous)
+        warning = (f"NOTE: {n_outside} of the {len(sql_ids)} matches were NOT in the previous result set, so this "
+                   f"refinement widened or changed the search instead of narrowing it. Check the SQL."
+                   if n_outside else "")
+        self._trace(f"[Refine] {warning or f'All {len(sql_ids)} matches lie within the previous {len(previous)}.'}")
 
-        self._log(mode="new_search", query=user_input, sql=sql_query, answer=answer)
-        trace = self._trace_finalize()
-        return {"answer": answer, "images": image_urls, "sql": sql_query, "table": df, "trace": trace,
-                "vlm_description": image_analysis}
-
+        self.retrieve(sql_ids, sql_for_ids, self.last_vector_hits, self.last_search_was_image, self.last_query_vec)
+        self.last_sql, self.last_sql_ids = refined_sql, sql_ids
+        self.last_question = f"{self.last_question} (refined: {instruction})"
+        return self._finish("refine", instruction, self.last_question, refined_sql, warning)
 
     def follow_up(self, user_question: str):
         """
         Reason over the currently retrieved context without re-running retrieval
         """
 
-        if not self.current_context_str:
+        if self.context_df.empty:
             return self.new_search(user_question)
 
         self._trace_reset()
         self._trace(f"[Follow-up] query={user_question!r}")
-        self._trace(f"[Follow-up] No retrieval re-run. Reusing {len(self.current_hybrid_ids)} artwork(s) "
-                    f"from the last search: {self.current_hybrid_ids}")
-        self._trace(f"[Follow-up] Conversation history so far: {len(self.history) // 2} prior turn(s)")
+        self._trace(f"[Follow-up] No retrieval re-run. Reusing the {len(self.context_df)} artwork(s) in the context; "
+                    f"{len(self.history) // 2} prior turn(s)")
 
         answer = self.synthesize(user_question)
-        self._log(mode="follow_up", query=user_question, sql=self.last_sql_query, answer=answer)
-        _, _, df = self.fetch_context(self.current_hybrid_ids, self.current_source_map)
-        trace = self._trace_finalize()
-        return {"answer": answer, "images": self.current_image_urls, "sql": self.last_sql_query, "table": df,
-                "trace": trace, "vlm_description": self.current_image_analysis}
+        self._log("follow_up", user_question, self.last_sql, answer)
+        return self._result(answer, self.last_sql)
 
     def rerun_edited_sql(self, edited_sql: str):
         """
-        Re-run a researcher-edited SQL string, keep prior vector ids, refresh context, resynthesize
+        Re-run a researcher-edited SQL string, keep prior vector hits and query vector, refresh results, resynthesize
         """
 
         self._trace_reset()
         self._trace(f"[Re-run SQL] Researcher-edited query: {edited_sql}")
         try:
-            sql_ids = self.run_sql(edited_sql)
-            self._trace(f"[Re-run SQL] Matched {len(sql_ids)} row(s): {sql_ids}")
+            sql_ids, sql_for_ids = self.run_sql(edited_sql)
+            self._trace(f"[Re-run SQL] Matched {len(sql_ids)} row(s): {_preview_ids(sql_ids)}")
         except Exception as e:
-            self._trace(f"[Re-run SQL Error] {e}")
-            return {"answer": f"SQL rejected: {e}", "images": [], "sql": edited_sql, "table": pd.DataFrame(),
-                    "trace": self._trace_finalize(), "vlm_description": ""}
+            return self._error(f"SQL rejected: {e}", edited_sql)
 
-        sql_set = set(sql_ids)
-        if sql_ids and not self.last_search_was_image:
-            filtered_vector_ids = [v for v in self.last_vector_ids if v in sql_set]
-            self._trace(f"[RRF] Reusing vector scores from the last search. Text mode - vector candidates"
-                        f"Restricted to SQL's rowid set: {filtered_vector_ids} (of {self.last_vector_ids})")
-            hybrid_ids = reciprocal_rank_fusion(sql_ids, filtered_vector_ids)
-        else:
-            if self.last_search_was_image:
-                self._trace("[RRF] Reusing vector scores from the last (image) search. Image mode — SQL and "
-                            "vector are fused as two independent ranked lists (rows found by both rank "
-                            "highest; rows found by only one still appear).")
-            hybrid_ids = reciprocal_rank_fusion(sql_ids, self.last_vector_ids)
-        self._trace(f"[RRF] Final fused ranking ({len(hybrid_ids)} artwork(s)): {hybrid_ids}")
+        self.retrieve(sql_ids, sql_for_ids, self.last_vector_hits, self.last_search_was_image, self.last_query_vec)
+        self.last_sql, self.last_sql_ids = edited_sql, sql_ids
+        return self._finish("rerun_sql", "(edited SQL)", "Describe and compare the retrieved artworks.", edited_sql)
 
-        vector_set = set(self.last_vector_ids)
-        source_map = {
-            rid: {"sql": rid in sql_set, "vector": rid in vector_set, "vector_score": self.last_vector_scores.get(rid)}
-            for rid in hybrid_ids
-        }
+    def _finish(self, mode: str, log_query: str, question: str, sql: str, warning: str = ""):
+        """
+        Common end of every retrieval: reset the conversation, answer (or report no matches), log
+        """
 
-        context_str, image_urls, df = self.fetch_context(hybrid_ids, source_map)
-        self.current_context_str = context_str
-        self.current_hybrid_ids = hybrid_ids
-        self.current_image_urls = image_urls
-        self.current_source_map = source_map
-        self.last_sql_query = edited_sql
         self.history = []
+        answer = self.synthesize(question) if not self.context_df.empty else "No artworks matched this query."
+        if warning:
+            answer = f"{warning}\n\n{answer}"
+        self._log(mode, log_query, sql, answer)
+        return self._result(answer, sql)
 
-        if not hybrid_ids:
-            answer = "No artworks matched the edited SQL query."
-        else:
-            answer = self.synthesize("Describe and compare the retrieved artworks.")
+    def _result(self, answer: str, sql: str) -> dict:
+        return {"answer": answer, "images": self.images, "sql": sql, "table": self.context_df,
+                "trace": "\n".join(self._trace_buffer), "vlm_description": self.image_analysis,
+                "profile": self.profile, "all_matches": self.results.head(MAX_RESULT_ROWS_DISPLAY)}
 
-        self._log(mode="rerun_sql", query="(edited SQL)", sql=edited_sql, answer=answer)
-        trace = self._trace_finalize()
-        return {"answer": answer, "images": image_urls, "sql": edited_sql, "table": df, "trace": trace,
-                "vlm_description": self.current_image_analysis}
+    def _error(self, message: str, sql: str) -> dict:
+        self._trace(f"[Error] {message}")
+        return {"answer": message, "images": [], "sql": sql, "table": pd.DataFrame(),
+                "trace": "\n".join(self._trace_buffer), "vlm_description": "", "profile": "",
+                "all_matches": pd.DataFrame()}
 
     def _log(self, mode: str, query: str, sql: str, answer: str):
+        # Which records the answer was based on, and how they were chosen, are logged with every answer
         self.session_log.append({
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
             "mode": mode,
             "query": query,
             "sql": sql,
             "answer": answer,
+            "total_matches": len(self.results),
+            "ranking_note": self.ranking_note,
+            "context_records": ";".join(self.context_df[OBJECT_NUMBER_COLUMN].astype(str)) if not self.context_df.empty else "",
+            "llm": LLM_MODEL_NAME,
         })
 
     def export_log_csv(self) -> str:
         out_path = str(CURRENT_DIR / "session_log.csv")
         with open(out_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "mode", "query", "sql", "answer"])
+            writer = csv.DictWriter(f, fieldnames=["timestamp", "mode", "query", "sql", "answer", "total_matches",
+                                                   "ranking_note", "context_records", "llm"])
             writer.writeheader()
             writer.writerows(self.session_log)
         return out_path
 
+    def export_results_csv(self) -> Optional[str]:
+        """
+        Exports ALL matches of the current search (no display limit)
+        """
 
-engine = ResearchEngine(conn, MAIN_TABLE, IMAGE_COLUMN, faiss_index, faiss_row_ids, embedding_model)
+        if self.results.empty:
+            return None
+        out_path = str(CURRENT_DIR / "search_results.csv")
+        self.results.to_csv(out_path, index=False, encoding="utf-8")
+        return out_path
+
+
+engine = ResearchEngine(conn, MAIN_TABLE, faiss_index, faiss_row_ids, embedding_model)
 
 
 # 8. GRADIO FRONTEND INTERFACE
 
 
+def _outputs(result: dict) -> tuple:
+    return (result["answer"], result["images"], result["sql"], result["table"], pd.DataFrame(engine.session_log),
+            result["trace"], result["vlm_description"], result["profile"], result["all_matches"])
+
+
 def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str,
                  include_vector_for_text: bool, use_caption_for_sql: bool):
     if not user_query or not user_query.strip():
-        if mode == "Follow-up (reason over current results)" or uploaded_image is None:
-            return (
-                "Please provide a question or upload an image.",
-                [],
-                "",
-                pd.DataFrame(),
-                pd.DataFrame(engine.session_log),
-                "",
-                ""
-            )
+        if mode != "New search" or uploaded_image is None:
+            return ("Please provide a question or upload an image.", [], "", pd.DataFrame(),
+                    pd.DataFrame(engine.session_log), "", "", "", pd.DataFrame())
     try:
         image = uploaded_image.convert("RGB") if uploaded_image is not None else None
         if mode == "New search":
             result = engine.new_search(user_query, image, include_vector_for_text=include_vector_for_text,
                                        use_caption_for_sql=use_caption_for_sql)
+        elif mode == "Refine current search":
+            result = engine.refine_search(user_query)
         else:
             result = engine.follow_up(user_query)
-        log_df = pd.DataFrame(engine.session_log)
-        return (result["answer"], result["images"], result["sql"], result["table"], log_df,
-                result.get("trace", ""), result.get("vlm_description", ""))
+        return _outputs(result)
     except Exception as e:
-        return f"Error: {e}", [], "", pd.DataFrame(), pd.DataFrame(engine.session_log), "", ""
+        return _outputs(engine._error(f"Error: {e}", ""))
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -806,35 +1034,35 @@ def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: s
 
 def handle_rerun_sql(edited_sql: str):
     try:
-        result = engine.rerun_edited_sql(edited_sql)
-        log_df = pd.DataFrame(engine.session_log)
-        return (result["answer"], result["images"], result["sql"], result["table"], log_df,
-                result.get("trace", ""), result.get("vlm_description", ""))
+        return _outputs(engine.rerun_edited_sql(edited_sql))
     except Exception as e:
-        return f"Error: {e}", [], edited_sql, pd.DataFrame(), pd.DataFrame(engine.session_log), "", ""
-
-
-def handle_export_log():
-    return engine.export_log_csv()
+        return _outputs(engine._error(f"Error: {e}", edited_sql))
 
 
 with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
     gr.Markdown(
-        """
+        f"""
         # Rijksmuseum Graphic Arts Research Assistant
         Text-to-SQL + multimodal vector search over the early modern prints and
         drawings collection. The generated SQL and retrieved records are shown below so
         you can inspect and correct retrieval, not just the final answer — including
         whether each row came from SQL, visual similarity, or both.
+
+        *{INDEX_STATUS}*
+
+        The model reads a **sample** of the matches in detail; exact figures about **all** matches
+        are in the profile, and the full result set is in the "All matches" table and CSV export.
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
             mode_toggle = gr.Radio(
-                ["New search", "Follow-up (reason over current results)"],
+                ["New search", "Refine current search", "Follow-up (reason over current results)"],
                 value="New search",
                 label="Mode",
+                info=("Refine: narrows the full result set of the current search (e.g. 'only those after 1575'). "
+                      "Follow-up: reasons only over the records in the model's context, without searching again."),
             )
             user_input = gr.Textbox(label="Question", lines=3,
                                     placeholder="e.g. Which prints were produced by Cornelis Cort?")
@@ -843,18 +1071,16 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
                 label="Also use visual similarity search (CLIP) for this text query",
                 value=False,
                 info=(
-                    "Off by default: CLIP text-image matching only works well for short, "
-                    "topic-heavy phrasing (e.g. 'farm animals', 'landscapes'), not specific or "
-                    "technical questions, so it's opt-in to avoid diluting results. Always runs "
-                    "automatically when you upload an image instead."
+                    "Off by default: CLIP text-image matching only works well for short, topic-heavy phrasing "
+                    "(e.g. 'farm animals', 'landscapes'). It only re-ranks the SQL matches (or searches on its own "
+                    "if SQL finds nothing). Always runs automatically when you upload an image."
                 ),
             )
             caption_for_sql_checkbox = gr.Checkbox(
                 label="Use image description to filter by metadata (experimental)",
                 value=False,
                 info=(
-                    "Off by default. The small vision model's description is always shown to the "
-                    "answer model as context, but it can misjudge medium or period, and as an SQL "
+                    "Off by default. The small vision model can misjudge medium or period, and as an SQL "
                     "filter those mistakes would silently exclude good matches. When ticked, only "
                     "two condensed keywords (object type, subject) are added to your typed question."
                 ),
@@ -865,31 +1091,36 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
             sql_box = gr.Textbox(label="SQL", lines=4)
             rerun_btn = gr.Button("Re-run edited SQL")
 
+            export_results_btn = gr.Button("Export all matches (CSV)")
+            export_results_file = gr.File(label="Search results download")
             export_btn = gr.Button("Export session log (CSV)")
             export_file = gr.File(label="Session log download")
 
         with gr.Column(scale=2):
-            output_answer = gr.Textbox(label="Answer", lines=10, interactive=False)
-            output_gallery = gr.Gallery(label="Matched artwork images", columns=3, height=300)
-            output_table = gr.Dataframe(label="Retrieved records", wrap=True)
+            output_answer = gr.Textbox(label="Answer (with sources from the database)", lines=12, interactive=False)
+            profile_box = gr.Textbox(label="Result set profile (exact, computed over ALL matches)", lines=6,
+                                     interactive=False)
+            output_gallery = gr.Gallery(label="Matched artwork images (in the model's context)", columns=3, height=300)
+            output_table = gr.Dataframe(label="Records in the model's context", wrap=True)
+            all_matches_table = gr.Dataframe(
+                label=f"All matches (chronological; first {MAX_RESULT_ROWS_DISPLAY} shown, export for the full set)",
+                wrap=True)
             vlm_box = gr.Textbox(label="VLM description of uploaded image", lines=3, interactive=False)
             with gr.Accordion("Retrieval trace (debug)", open=False):
                 trace_box = gr.Textbox(label="Step-by-step trace", lines=16, interactive=False)
             session_log_table = gr.Dataframe(label="Session log", wrap=True)
 
+    all_outputs = [output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box,
+                   profile_box, all_matches_table]
     submit_btn.click(
         fn=handle_query,
         inputs=[user_input, image_input, mode_toggle, vector_for_text_checkbox, caption_for_sql_checkbox],
-        outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box],
+        outputs=all_outputs,
     )
-    rerun_btn.click(
-        fn=handle_rerun_sql,
-        inputs=[sql_box],
-        outputs=[output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box],
-    )
-    export_btn.click(fn=handle_export_log, outputs=[export_file])
+    rerun_btn.click(fn=handle_rerun_sql, inputs=[sql_box], outputs=all_outputs)
+    export_results_btn.click(fn=engine.export_results_csv, outputs=[export_results_file])
+    export_btn.click(fn=engine.export_log_csv, outputs=[export_file])
 
 if __name__ == "__main__":
     # share=True for Colab (has no accessible localhost)
     demo.queue().launch(share=False, debug=False)
-
