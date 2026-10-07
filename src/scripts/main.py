@@ -954,13 +954,14 @@ class ResearchEngine:
     def _result(self, answer: str, sql: str) -> dict:
         return {"answer": answer, "images": self.images, "sql": sql, "table": self.context_df,
                 "trace": "\n".join(self._trace_buffer), "vlm_description": self.image_analysis,
-                "profile": self.profile, "all_matches": self.results.head(MAX_RESULT_ROWS_DISPLAY)}
+                "profile": self.profile, "all_matches": self.results.head(MAX_RESULT_ROWS_DISPLAY),
+                "n_matches": len(self.results)}
 
     def _error(self, message: str, sql: str) -> dict:
         self._trace(f"[Error] {message}")
         return {"answer": message, "images": [], "sql": sql, "table": pd.DataFrame(),
                 "trace": "\n".join(self._trace_buffer), "vlm_description": "", "profile": "",
-                "all_matches": pd.DataFrame()}
+                "all_matches": pd.DataFrame(), "n_matches": 0}
 
     def _log(self, mode: str, query: str, sql: str, answer: str):
         # Which records the answer was based on, and how they were chosen, are logged with every answer
@@ -1004,8 +1005,14 @@ engine = ResearchEngine(conn, MAIN_TABLE, faiss_index, faiss_row_ids, embedding_
 
 
 def _outputs(result: dict) -> tuple:
-    return (result["answer"], result["images"], result["sql"], result["table"], pd.DataFrame(engine.session_log),
-            result["trace"], result["vlm_description"], result["profile"], result["all_matches"])
+    # The two table titles state the actual numbers of each search, so the boxes can't be misread
+    n_all, n_context = result["n_matches"], len(result["table"])
+    context_table = gr.Dataframe(value=result["table"],
+                                 label=f"Records in the model's context: {n_context} of {n_all} matches (what the AI reads)")
+    all_table = gr.Dataframe(value=result["all_matches"], label=f"All matches: {n_all} records found by the search" + (
+        f" (first {MAX_RESULT_ROWS_DISPLAY} shown here; the CSV export has all)" if n_all > MAX_RESULT_ROWS_DISPLAY else ""))
+    return (result["answer"], result["images"], result["sql"], context_table, pd.DataFrame(engine.session_log),
+            result["trace"], result["vlm_description"], result["profile"], all_table)
 
 
 def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str,
@@ -1102,9 +1109,7 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
                                      interactive=False)
             output_gallery = gr.Gallery(label="Matched artwork images (in the model's context)", columns=3, height=300)
             output_table = gr.Dataframe(label="Records in the model's context", wrap=True)
-            all_matches_table = gr.Dataframe(
-                label=f"All matches (chronological; first {MAX_RESULT_ROWS_DISPLAY} shown, export for the full set)",
-                wrap=True)
+            all_matches_table = gr.Dataframe(label="All matches", wrap=True)
             vlm_box = gr.Textbox(label="VLM description of uploaded image", lines=3, interactive=False)
             with gr.Accordion("Retrieval trace (debug)", open=False):
                 trace_box = gr.Textbox(label="Step-by-step trace", lines=16, interactive=False)

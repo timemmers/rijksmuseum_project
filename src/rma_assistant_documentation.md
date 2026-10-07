@@ -1,7 +1,7 @@
 # Rijksmuseum Graphic Arts Research Assistant — Documentation
 
 This document explains what the prototype does, in what order, and where each piece of logic
-lives. It follows the section numbers of `rijksmuseum_assistant.py` so you can jump between the
+lives. It follows the section numbers of `main.py` so you can jump between the
 code and this document. The visual index is built separately, with the Colab notebook
 `build_faiss_index_colab.ipynb` (Section 9).
 
@@ -138,7 +138,7 @@ Question for SQL:
 generate_sql() ──► LLM writes one SELECT query (stops at the first ';')
         ▼
 run_sql() ──► safety checks, SELECT list rewritten to "SELECT rowid", executed read-only
-        │      → sql_ids (all matches) + sql_for_ids (the query, reused later as a subquery)
+        │      → sql_ids (IDs of all matches) + sql_for_ids (the same query, returning IDs only)
         ▼
 CLIP:
    - image uploaded         → query vector from the IMAGE + global FAISS search (threshold 0.60)
@@ -204,7 +204,7 @@ records the LLM reads and prepares everything else:
 2. Query vector + SQL matches: score_candidates() ranks the SQL matches by CLIP similarity
    (matches without an indexed image go to the end)
 3. load_records() ──► the FULL result set as one DataFrame
-                      (SQL matches loaded with the SQL query as a subquery + vector hits)
+                      (full records for all SQL matches (fetched by running sql_for_ids inside a second query plus the vector hits))
 4. The sample (max. RETRIEVAL_TOP_K records) and its ranking note:
    - image mode           : RRF of the ranked SQL matches and CLIP's global hits
    - SQL found nothing    : CLIP's global hits
@@ -219,8 +219,7 @@ records the LLM reads and prepares everything else:
 ```
 
 The chronological sample takes the middle record of each of 20 equal slices of the date-sorted
-matches, so it mirrors the date distribution of the full set. It is deterministic and easy to
-describe in a publication; a CLIP ranking for a metadata question ("prints by Cort") is not.
+matches, so it mirrors the date distribution of the full set.
 
 ---
 
@@ -324,7 +323,7 @@ For text queries CLIP is off by default; when you opt in, it only ranks what SQL
 **Reading `vector_similarity`:** a row marked `SQL` can have a similarity score; it comes from
 ranking the SQL matches, not from CLIP finding it. Only `Vector` and `SQL+Vector` rows were found
 by CLIP's global search. A score of 0.61, just above the 0.60 threshold, is a very different
-situation from 0.95, even though both rows are labelled "Vector".
+situation from 0.95, even though both rows are labelled "Vector"!
 
 ---
 
@@ -351,7 +350,7 @@ situation from 0.95, even though both rows are labelled "Vector".
 
 **Trace:** `_trace_buffer` — reset at the start of every request.
 
-**Session log:** `session_log` — never reset; exportable as CSV.
+**Session log:** `session_log` — never resets; exportable as CSV.
 
 ---
 
@@ -383,7 +382,6 @@ situation from 0.95, even though both rows are labelled "Vector".
 - **CLIP center-crops images.** For tall or wide prints the edges don't count in the similarity;
   this applies equally to the index and to uploaded images.
 - **The similarity thresholds (0.24 text, 0.60 image) are starting points,** not validated cutoffs.
-  Check them against known good and irrelevant matches (the scores are in the trace).
 - **Generated SQL can't count or group.** The SELECT list is always rewritten to `rowid`, so
   `COUNT`/`GROUP BY` questions rely on the profile or the exported CSV.
 
@@ -427,9 +425,6 @@ a Colab T4 GPU.
    vector, and why). The last cell re-embeds random images as a sanity check (expect ~0.99+).
 7. Download the three files from Drive into the folder of the assistant script.
 
-Memory stays low (about 0.4 GB of images in RAM per chunk); downloading, not the GPU, is the
-bottleneck. If the log shows many `HTTP 429` responses, lower `NUM_WORKERS` and continue.
-
 ---
 
 ## 10. Scaling up
@@ -442,6 +437,3 @@ traceability layers don't depend on it. Each model is one line in section 0.
 | LLM | Qwen2.5-1.5B-Instruct | Qwen2.5-3B / 7B-Instruct (4-bit) | 7B needs roughly 5–6 GB VRAM; much better Dutch, structure and citations. Raise `RETRIEVAL_TOP_K` with it |
 | VLM | SmolVLM-500M-Instruct | e.g. Qwen2.5-VL | Better medium and technique descriptions |
 | CLIP | clip-ViT-B-32 | clip-ViT-L-14 | Finer detail (hatching, states); needs a rebuilt index (`BATCH_SIZE = 64` in the notebook) and the same name in the app |
-
-To compare models, keep a fixed set of about ten typical questions and count per model how often
-the citation warning fires and how many factual errors the answers contain.
