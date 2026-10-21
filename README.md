@@ -17,7 +17,7 @@ an image that can be searched visually.
 2. Run `preprocessor.py` to create the SQLite database.
 3. Build the visual index with `build_faiss_index_colab.ipynb` (on a GPU). Embedding the images is slow; lower
    the maximum number of images if needed. The script only loads an index that matches its database.
-4. Run `rma_assistant.py` and open the Gradio link.
+4. Run `main.py` and open the Gradio link.
 
 ## Models
 
