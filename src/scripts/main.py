@@ -29,16 +29,34 @@ import gc
 # 0. CONFIGURATION (change LLMs according to computing power)
 
 LLM_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-# e.g. Qwen3.5
 VLM_MODEL_NAME = "HuggingFaceTB/SmolVLM-500M-Instruct"
-# e.g. Qwen2.5-VL
 CLIP_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
-# must be the model the FAISS index was built with
 
 ENABLE_VLM = True # set to False on low-resource machines: image searches then run on CLIP only
 
 CURRENT_DIR = Path(__file__).parent if "__file__" in globals() else Path(".")
 DATABASE_PATH = CURRENT_DIR.parent / "preprocessing" / "rma_artworks"
+# The researcher's annotations live in their own writable file; the museum database stays read-only
+ANNOTATIONS_PATH = CURRENT_DIR / "annotations.db"
+
+# Propagation: after an insight is saved, the system proposes other prints it may also apply to
+PROPAGATION_SIMILARITY = 0.975 # image -> image CLIP similarity for 'same design' (0.97-0.98 separated designs in the Cort test)
+PROPAGATION_SEARCH_K = 30 # nearest neighbours checked per annotated print
+PROPAGATION_MAX_PER_RULE = 40 # a 'same maker and date' rule matching more prints than this is too generic to propose
+PROPAGATION_MAX_TOTAL = 20 # max proposals per saved insight
+# 'Visually similar' finds related compositions or motifs (insights about similarity or influence): only the closest
+# few above a lower threshold. Starting values, like the other thresholds: check them against the scores in the trace
+PROPAGATION_SIMILAR_MIN = 0.88
+PROPAGATION_SIMILAR_MAX = 5 # max 'visually similar' proposals per saved insight
+# The grounds the researcher can choose per insight. Not every insight travels the same way: a copy follows the design,
+# an influence looks similar, a reissue may follow the date, an attribution may follow none of them
+GROUND_DESIGN = "same design (visually near-identical)"
+GROUND_SIMILAR = "visually similar (related composition or motif)"
+GROUND_MAKER_DATE = "same maker and date"
+PROPAGATION_GROUNDS = [GROUND_DESIGN, GROUND_SIMILAR, GROUND_MAKER_DATE]
+# Ticked by default. 'Same maker and date' is not: in testing it was right for one reissue campaign and mostly noise
+# for other insights (3 of 30 proposals confirmed), so the researcher switches it on when an insight follows the date
+PROPAGATION_DEFAULT_GROUNDS = [GROUND_DESIGN, GROUND_SIMILAR]
 
 RETRIEVAL_TOP_K = 20 # max number of records the answer LLM reads in detail (scale up with bigger models)
 VECTOR_SEARCH_K = 15
@@ -114,15 +132,27 @@ SQL_RULES = """CRITICAL RULES:
    "objectCreationDate[1]" BETWEEN '1450' AND '1850', or a narrower period if the question asks for one
    (e.g. 'after 1575' -> BETWEEN '1576' AND '1850'). Only use other years if the question explicitly asks for them.
 2. Use EXACT column names with brackets, e.g. "objectType[1]", "objectCreator[1]", "objectCreationDate[1]".
-3. The database uses Dutch terms. Translate English search terms into Dutch for LIKE clauses.
+3. The database uses Dutch terms. Translate English search terms into Dutch for LIKE clauses, including names
+   (e.g. Charles -> Karel, Mary -> Maria, John -> Johannes, coronation -> kroning, flood -> zondvloed).
    Examples: 'print' -> 'prent', 'drawing' -> 'tekening', 'landscape' -> 'landschap', 'portrait' -> 'portret'.
    Subjects can only be found through the Dutch title, and titles vary, so combine several Dutch terms with OR
    inside parentheses, e.g. landscape -> ("objectTitle[1]" LIKE '%landschap%' OR "objectTitle[1]" LIKE '%zicht%').
+   Each DIFFERENT element of the question must be in the title, so combine them with AND. Use OR only for
+   alternative words for the SAME element, inside parentheses. E.g. "the coronation of Charles V" ->
+   "objectTitle[1]" LIKE '%kroning%' AND "objectTitle[1]" LIKE '%Karel%', never kroning OR Karel.
 4. Creator names are stored as 'Lastname, Firstname' (e.g. 'Cort, Cornelis'). Never match a full name as one string.
    Instead: WHERE "objectCreator[1]" LIKE '%Cornelis%' AND "objectCreator[1]" LIKE '%Cort%'
-   Unattributed works have the creator 'anonymous'.
+   Unattributed works have the creator 'anonymous'. Names can be stored in another form than the question uses
+   (e.g. 'Gheyn, Jacob de' for Jacques de Gheyn): match on the most distinctive part of the name. When a query
+   names several makers, put each maker's conditions in their own parentheses:
+   (("objectCreator[1]" LIKE '%A%' AND ...) OR ("objectCreator[1]" LIKE '%B%' AND ...)).
 5. If the question includes a visual description (from an uploaded image) rather than explicit search terms,
    infer plausible object type / subject / period filters from it the same way you would from a text question.
+6. Researcher knowledge: the view annotated(rowid_ref, label, note, origin) holds the researcher's confirmed
+   annotations; rowid_ref is the rowid of the annotated artwork. The catalogue has NO columns for publishers,
+   reissues, states, copies, sources or other interpretations: these can only be found through annotated, with
+   rowid IN (SELECT rowid_ref FROM annotated WHERE label LIKE '%term%' OR note LIKE '%term%')
+   Never invent columns that are not in the schema.
 """
 
 SQL_FILTER_SYS = f"""You are an expert AI assistant that translates natural language questions into executable SQLite SQL queries.
@@ -139,8 +169,14 @@ SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "ob
 Question: Show me drawings of landscapes from the 16th century
 SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%tekening%' AND ("objectTitle[1]" LIKE '%landschap%' OR "objectTitle[1]" LIKE '%zicht%') AND "objectCreationDate[1]" BETWEEN '1501' AND '1600';
 
+Question: Show me prints of the coronation of emperor Charles V
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectTitle[1]" LIKE '%kroning%' AND "objectTitle[1]" LIKE '%Karel%' AND "objectCreationDate[1]" BETWEEN '1450' AND '1850';
+
 Question: Show me 17th century portrait prints
 SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectTitle[1]" LIKE '%portret%' AND "objectCreationDate[1]" BETWEEN '1601' AND '1700';
+
+Question: Which prints by Hendrick Goltzius are annotated as later states?
+SQL: SELECT rowid FROM {MAIN_TABLE} WHERE "objectType[1]" LIKE '%prent%' AND "objectCreator[1]" LIKE '%Hendrick%' AND "objectCreator[1]" LIKE '%Goltzius%' AND rowid IN (SELECT rowid_ref FROM annotated WHERE label LIKE '%state%' OR note LIKE '%state%') AND "objectCreationDate[1]" BETWEEN '1450' AND '1850';
 
 Return ONLY the raw SQL query ending with a semicolon, nothing else."""
 
@@ -170,29 +206,70 @@ early modern print and drawing collection.
 
 You are given a set of retrieved artwork records as context. Use ONLY this context and the
 conversation so far — do not invent facts that are not present in it. You see catalogue metadata
-(title, object type, creator, creation date), not the images themselves.
+(title, object type, creator, creation date) and the researcher's annotations, never the images: do not
+describe style, composition, detail, quality or technique beyond what the metadata or an annotation states.
 
 For a NEW question, answer in this structure:
 1. Answer: 1-3 sentences that answer the question directly. Take every number, date range or
    distribution about the whole result set from the exact facts about all matches, never from
    counting the records in the context.
-2. Observations: 2-4 points about the records in the context (themes, series, chronology, contrasts,
+2. Observations: 1-4 points about the records in the context (themes, series, chronology, contrasts,
    outliers), each starting with the artwork it is based on, e.g. "Artwork #4 (1559): ...".
+   Only make observations the metadata or annotations support: fewer points are better than invented ones.
+   Each observation must compare records, or use an annotation. Never just restate a title or call something
+   "a religious scene".
 3. Limits: 1-2 sentences on what these records cannot show (e.g. metadata only, or only a sample).
 For a FOLLOW-UP question, answer it directly without this structure, but still cite every claim as "Artwork #N".
 
 Guidelines:
 - If the context doesn't contain enough information to answer confidently, say so explicitly
   rather than guessing.
+- If the records in the context do not match what the question asks for (e.g. the search found other subjects
+  or other makers), say so plainly and suggest refining the search. Never reinterpret an unrelated title to
+  make it fit the question.
+- Never claim that something is not in the database: you only see the results of this search. Say that this
+  search did not find it, and that the search terms or name forms may need adjusting.
 - If a question concerns records that are not in the context (e.g. a subset of all matches),
   say that a refined or new search is needed instead of answering from the context.
 - A date in a title usually refers to the depicted event or place, not to when the object was made
   (e.g. a battle of 1693 in a print made in 1702); use the creation date for the object itself.
+- The context may end with a RESEARCHER ANNOTATIONS block. These are knowledge the researcher wrote or
+  confirmed, not catalogue metadata, and the most important context for interpretation. When annotations
+  are relevant to the question, use them already in the Answer, not only in the Observations. Cite them as
+  "Annotation A<n>" next to the artwork (e.g. "Artwork #2 (Annotation A1): ..."), and say so if the records
+  seem to contradict them.
 - Write for a researcher: precise, willing to flag uncertainty, comfortable making a reasoned
   comparative judgment rather than only describing.
 
 Database Context (retrieved artworks for this session):
 {context}
+"""
+
+# Drafting only restructures what the researcher said; the researcher checks and saves the draft
+ANNOTATION_DRAFT_SYS = """You turn a researcher's insight about artworks in a print collection into a structured
+annotation. You get the artworks currently on screen and the researcher's own words.
+
+Reply with ONLY a JSON object, nothing else:
+{"artworks": [<artwork numbers>], "label": "<short label>", "note": "<note>"}
+
+RULES:
+1. artworks: the numbers of the artworks the insight is about, chosen ONLY from the list on screen.
+   Resolve references such as '#2', 'the 1602 print' or 'the earlier impressions' using the list.
+2. label: 2-5 words naming the insight, e.g. "later state".
+3. note: the researcher's insight in one or two clear sentences. Use ONLY what the researcher said:
+   never add facts, dates, names, counts or interpretations they did not mention, and never make the note
+   more specific than their words.
+4. Never refer to artworks by their "Artwork #" number in the note: these numbers change with every search.
+   If the note must refer to another artwork, use its inventory number.
+5. If it is unclear which artworks are meant, use an empty list. Select all artworks only if the
+   researcher explicitly says the insight applies to all of them.
+
+EXAMPLE:
+Artworks on screen:
+Artwork #1 | RP-P-OB-1001 | Landschap met jagers | 1575
+Artwork #2 | RP-P-OB-1002 | Landschap met jagers | 1610
+Researcher: #2 is a later state of #1, the address was changed
+JSON: {"artworks": [2], "label": "later state", "note": "A later state of the plate of RP-P-OB-1001, with a changed address."}
 """
 
 
@@ -275,56 +352,55 @@ else:
 
 
 def analyze_image(user_image: Image.Image) -> str:
-        """
-        Analyzes an uploaded image using the VLM
-        """
+    """
+    Analyzes an uploaded image using the VLM
+    """
 
-        if user_image is None or vlm_model is None or vlm_processor is None:
-            return ""
+    if user_image is None or vlm_model is None or vlm_processor is None:
+        return ""
 
-        try:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {
-                            "type": "text",
-                            "text": (
-                                "Describe this artwork for an art-historical comparison. "
-                                "Cover: likely medium/technique (e.g. engraving, etching, chalk drawing), "
-                                "line quality, composition type (portrait, landscape, scene), subject matter, "
-                                "and any stylistic cues to period or origin. Be specific, not generic."
-                            ),
-                        },
-                    ],
-                }
-            ]
-            prompt = vlm_processor.apply_chat_template(messages, add_generation_prompt=True)
-            inputs = vlm_processor(text=prompt, images=[user_image], return_tensors="pt")
-            device = next(vlm_model.parameters()).device
-            inputs = inputs.to(device)
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {
+                        "type": "text",
+                        "text": (
+                            "Describe this artwork for an art-historical comparison. "
+                            "Cover: likely medium/technique (e.g. engraving, etching, chalk drawing), "
+                            "line quality, composition type (portrait, landscape, scene), subject matter, "
+                            "and any stylistic cues to period or origin. Be specific, not generic."
+                        ),
+                    },
+                ],
+            }
+        ]
+        prompt = vlm_processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = vlm_processor(text=prompt, images=[user_image], return_tensors="pt")
+        device = next(vlm_model.parameters()).device
+        inputs = inputs.to(device)
 
-            # Tweak these parameters for more (or less) creative descriptions; e.g do_sample false
-            input_len = inputs["input_ids"].shape[1]
-            with torch.no_grad():
-                generated_ids = vlm_model.generate(
-                    **inputs,
-                    max_new_tokens=220,
-                    do_sample=True,
-                    temperature=0.3,
-                    top_p=0.85,
-                    repetition_penalty=1.1,
-                )
+        # Tweak these parameters for more (or less) creative descriptions; e.g do_sample false
+        input_len = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            generated_ids = vlm_model.generate(
+                **inputs,
+                max_new_tokens=220,
+                do_sample=True,
+                temperature=0.3,
+                top_p=0.85,
+                repetition_penalty=1.1,
+            )
 
-            new_tokens = generated_ids[:, input_len:]
-            text = vlm_processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
-            print(f"[VLM] Description generated: {text}")
-            return text
-        except Exception as e:
-            print(f"[VLM] Error: {e}")
-            return ""
-
+        new_tokens = generated_ids[:, input_len:]
+        text = vlm_processor.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+        print(f"[VLM] Description generated: {text}")
+        return text
+    except Exception as e:
+        print(f"[VLM] Error: {e}")
+        return ""
 
 
 # 5. CLIP EMBEDDINGS + FAISS INDEX
@@ -406,10 +482,132 @@ def reciprocal_rank_fusion(sql_ids: list, vector_ids: list, k: int = 60, top_n: 
     return sorted(scores.keys(), key=lambda d:scores[d], reverse=True)[:top_n]
 
 
+# 6b. RESEARCHER ANNOTATIONS
+# The researcher's insights, stored in their own writable SQLite file (ANNOTATIONS_PATH), never in the
+# museum database. One annotation can cover several artworks ("these are reissues of one plate"), so there
+# are two tables: the insight itself, and which records it applies to. 'origin' and 'status' record the
+# provenance: researcher insights are saved as confirmed; system proposals (origin 'system') stay 'proposed'
+# until the researcher confirms or rejects them
+
+def open_annotations(path: Path):
+    """
+    Opens (or creates) the annotations database
+    """
+
+    # check_same_thread=False: Gradio handles requests in different threads
+    ann_conn = sqlite3.connect(str(path), check_same_thread=False)
+    ann_conn.execute("PRAGMA foreign_keys = ON")
+    ann_conn.executescript("""
+        CREATE TABLE IF NOT EXISTS annotations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            label       TEXT,
+            note        TEXT NOT NULL,
+            origin      TEXT NOT NULL CHECK (origin IN ('researcher', 'system')),
+            status      TEXT NOT NULL CHECK (status IN ('proposed', 'confirmed', 'rejected')),
+            based_on    INTEGER REFERENCES annotations(id),
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS annotation_records (
+            annotation_id  INTEGER NOT NULL REFERENCES annotations(id),
+            rowid_ref      INTEGER NOT NULL,
+            PRIMARY KEY (annotation_id, rowid_ref)
+        );
+    """)
+    # 'rowid_ref', not 'rowid': every SQLite table already has a hidden rowid column, which a column
+    # with the same name would shadow. rowid_ref REFERS to a rowid in the museum database
+
+    # 'reason': why the SYSTEM proposed an annotation. Added this way (not in CREATE TABLE) so that annotation
+    # files created before this column existed are upgraded instead of failing
+    columns = [col[1] for col in ann_conn.execute("PRAGMA table_info(annotations)")]
+    if "reason" not in columns:
+        with ann_conn:
+            ann_conn.execute("ALTER TABLE annotations ADD COLUMN reason TEXT")
+    print(f"[Annotations] Using '{Path(path).resolve()}'") # the full path, so you can see where the file really is
+    return ann_conn
+
+
+def add_annotation(ann_conn, rowids: list, note: str, label: Optional[str] = None,
+                   origin: str = "researcher", status: str = "confirmed", based_on: Optional[int] = None,
+                   reason: Optional[str] = None) -> int:
+    """
+    Saves one insight about one or more records; returns its id
+    """
+
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    with ann_conn: # one transaction: either the annotation AND its records are saved, or nothing
+        cursor = ann_conn.execute(
+            "INSERT INTO annotations (label, note, origin, status, based_on, reason, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (label, note, origin, status, based_on, reason, now, now),
+        )
+        annotation_id = cursor.lastrowid
+        ann_conn.executemany("INSERT INTO annotation_records (annotation_id, rowid_ref) VALUES (?, ?)",
+                             [(annotation_id, int(r)) for r in rowids])
+    return annotation_id
+
+
+def all_annotations(ann_conn) -> dict:
+    """
+    All CONFIRMED annotations, grouped per museum rowid: proposals only count as knowledge once the researcher
+    confirms them. The table stays small, so loading all of it is simpler and safer than an IN (...) query over
+    thousands of matches
+    """
+
+    rows = ann_conn.execute("""
+        SELECT ar.rowid_ref, a.id, a.label, a.note, a.origin, a.status, a.reason
+        FROM annotation_records ar
+        JOIN annotations a ON a.id = ar.annotation_id
+        WHERE a.status = 'confirmed'
+        ORDER BY a.created_at
+    """).fetchall()
+
+    by_rowid = {}
+    for rowid_ref, ann_id, label, note, origin, status, reason in rows:
+        by_rowid.setdefault(int(rowid_ref), []).append(
+            {"id": ann_id, "label": label, "note": note, "origin": origin, "status": status, "reason": reason})
+    return by_rowid
+
+
+def set_annotation_status(ann_conn, annotation_ids: list, status: str):
+    """
+    Confirms or rejects annotations (e.g. system proposals). Rejected ones are kept, not deleted, so the
+    history stays visible and they are never proposed again
+    """
+
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    with ann_conn:
+        ann_conn.executemany("UPDATE annotations SET status = ?, updated_at = ? WHERE id = ?",
+                             [(status, now, int(i)) for i in annotation_ids])
+
+
+def attach_annotations(db_conn, path: Path):
+    """
+    Makes CONFIRMED annotations searchable by the generated SQL: the annotations file is attached READ-ONLY to
+    the museum connection, with a view 'annotated'. Writing still only happens through the annotations
+    connection, so no generated query can change an annotation
+    """
+
+    uri = f"{Path(path).resolve().as_uri()}?mode=ro" # the museum connection was opened with uri=True
+    db_conn.execute("ATTACH DATABASE ? AS ann", (uri,))
+    # TEMP: the view lives in the connection's temporary schema, so the read-only museum file is untouched
+    db_conn.execute("""
+        CREATE TEMP VIEW annotated AS
+        SELECT ar.rowid_ref AS rowid_ref, a.label AS label, a.note AS note, a.origin AS origin
+        FROM ann.annotation_records ar
+        JOIN ann.annotations a ON a.id = ar.annotation_id
+        WHERE a.status = 'confirmed'
+    """)
+    print("[Annotations] Confirmed annotations are searchable by SQL (view 'annotated', read-only)")
+
+
+def _annotation_text(ann: dict) -> str:
+    return f"{ann['label']}: {ann['note']}" if ann["label"] else ann["note"]
+
+
 # 7. PROTOTYPE ENGINE
 
 DANGEROUS_KEYWORDS = ["drop", "delete", "update", "insert", "alter", "create", "truncate", "attach", "pragma"]
-# Word boundaries (\b) so that e.g. a creator named 'Walter' doesn't trigger 'alter'
 DANGEROUS_PATTERN = re.compile(r"\b(" + "|".join(DANGEROUS_KEYWORDS) + r")\b", re.IGNORECASE)
 
 
@@ -424,6 +622,16 @@ def _is_filled(value) -> bool:
     return pd.notna(value) and str(value).strip() not in ("", "<null>")
 
 
+def _year(value) -> float:
+    """
+    The first four-digit year in a date, so '1602', '1525-04-11' and 'ca. 1570' all work.
+    pd.to_numeric would turn full dates like '1525-04-11' into 'no value', which sorted them last
+    """
+
+    match = re.search(r"(?<!\d)(\d{4})(?!\d)", str(value)) if _is_filled(value) else None
+    return float(match.group(1)) if match else float("nan")
+
+
 class ResearchEngine:
     """
     Holds retrieval state (current results) and conversation history separately,
@@ -433,14 +641,19 @@ class ResearchEngine:
     Results are kept at two levels:
     - self.results: ALL records that matched (the 'All matches' table, the profile and the CSV export)
     - self.context_df: the sample of those records the answer LLM reads in detail ("Artwork #1" ...)
+
+    The researcher's annotations (separate database) are attached to both, and to the LLM's context
     """
 
-    def __init__(self, db_conn, table_name, faiss_idx, row_ids_arr, embed_model):
+    def __init__(self, db_conn, table_name, faiss_idx, row_ids_arr, embed_model, ann_conn):
         self.db_conn = db_conn
         self.table_name = table_name
+        # Column names of the museum table, so column names taken from generated SQL can be checked
+        self.columns = [col[1] for col in db_conn.execute(f"PRAGMA table_info('{table_name}')")]
         self.faiss_index = faiss_idx
         self.row_ids = row_ids_arr
         self.embed_model = embed_model
+        self.ann_conn = ann_conn
 
         # rowid -> position in the FAISS index, so any set of rows (e.g. SQL hits) can be scored directly
         self.rowid_to_pos = {int(r): i for i, r in enumerate(row_ids_arr)}
@@ -452,6 +665,12 @@ class ResearchEngine:
         self.images = []
         self.profile = ""
         self.ranking_note = "" # how the sample was chosen; told to the answer LLM
+
+        # Annotations: per rowid (all of them), and the ones in the current context (id -> annotation),
+        # so citations like "Annotation A1" can be checked
+        self.annotations_by_rowid = {}
+        self.context_annotations = {}
+        self.last_cited_annotations = [] # annotations the last answer mentioned (for the log)
 
         # Kept so refinements and edited SQL can build on the last search without re-running CLIP
         self.last_sql = ""
@@ -520,6 +739,79 @@ class ResearchEngine:
             {"role": "user", "content": f"Previous SQL: {previous_sql};\nRefinement: {instruction}\nSQL:"},
         ]
         return self._clean_sql(generate_chat(messages, max_new_tokens=300, stop_strings=[";"]))
+
+    def retry_sql(self, question: str, failed_sql: str, counts: list) -> str:
+        """
+        One retry after a query found nothing, with the term counts as feedback: the DATA shows which search terms
+        don't occur in the catalogue, instead of the model guessing why nothing was found
+        """
+
+        feedback = "\n".join(f"- {col} contains '{pattern.strip('%')}': {n} record(s)" for col, pattern, n in counts)
+        messages = [
+            {"role": "system", "content": SQL_FILTER_SYS},
+            {"role": "user", "content": (
+                f"Question: {question}\n"
+                f"This query found nothing:\n{failed_sql};\n"
+                f"Number of records in the whole catalogue that contain each search term:\n{feedback}\n"
+                "Terms with 0 records do not occur in the catalogue. Write a new query that replaces them with other "
+                "Dutch words for the same element (a synonym, another spelling, the Dutch form of a name, or a shorter "
+                "word stem), and keeps the other conditions.\nSQL query:")},
+        ]
+        return self._clean_sql(generate_chat(messages, max_new_tokens=250, stop_strings=[";"]))
+
+    def term_counts(self, sql_text: str, limit: int = 8) -> list:
+        """
+        For every "column" LIKE '...' condition in a query: how many records in the whole catalogue match it on
+        its own. Computed by the database, so it shows which words of a query actually occur in the catalogue
+        Returns (column, pattern, count) triples
+        """
+
+        conditions = []
+        for col, pattern in re.findall(r"\"([^\"]+)\"\s+LIKE\s+'([^']*)'", sql_text, flags=re.IGNORECASE):
+            if col in self.columns and (col, pattern) not in conditions: # only real columns, never raw SQL
+                conditions.append((col, pattern))
+        return [(col, pattern, int(self.db_conn.execute(
+                    f'SELECT COUNT(*) FROM {self.table_name} WHERE "{col}" LIKE ?', (pattern,)).fetchone()[0]))
+                for col, pattern in conditions[:limit]]
+
+    @staticmethod
+    def _term_note(counts: list) -> str:
+        return ("records in the catalogue containing each search term: " +
+                "; ".join(f"'{pattern.strip('%')}' ({col}): {n}" for col, pattern, n in counts)) if counts else ""
+
+    def _check_empty_result(self, sql_text: str, question: Optional[str] = None):
+        """
+        SQL guardrail for a query that found nothing. The term counts show which words don't occur in the
+        catalogue. With a question (a generated query), the model gets one retry with the counts as feedback;
+        without one (the researcher's own SQL), only the counts are shown and the query is never rewritten
+        Returns (sql, sql_ids, sql_for_ids, note for the researcher)
+        """
+
+        counts = self.term_counts(sql_text)
+        note = self._term_note(counts)
+        self._trace(f"[Terms] Nothing found. {note or 'No LIKE conditions to check.'}")
+        missing = [pattern.strip('%') for _, pattern, n in counts if n == 0]
+        if not missing:
+            hint = (" Every term occurs on its own, so the combination is too narrow." if counts else "")
+            return sql_text, [], "", f"NOTE: the query found nothing.{hint} {note}".strip()
+        if question is None:
+            return sql_text, [], "", (f"NOTE: the query found nothing; these terms don't occur in the catalogue: "
+                                      f"{', '.join(missing)}. {note}")
+
+        retried = self.retry_sql(question, sql_text, counts)
+        self._trace(f"[Terms] Retry with the term counts as feedback: {retried}")
+        try:
+            sql_ids, sql_for_ids = self.run_sql(retried)
+        except Exception as e:
+            self._trace(f"[SQL Error] Retry rejected: {e}")
+            return sql_text, [], "", f"NOTE: the query found nothing. {note}"
+        self._trace(f"[Terms] Retry matched {len(sql_ids)} row(s): {_preview_ids(sql_ids)}")
+        if sql_ids:
+            return retried, sql_ids, sql_for_ids, (
+                f"NOTE: the first query found nothing, because these terms don't occur in the catalogue: "
+                f"{', '.join(missing)}. The system retried once with other terms: check the SQL shown.")
+        return retried, [], "", (f"NOTE: the query found nothing, also after one retry. First query: {note}. "
+                                 f"Retry: {self._term_note(self.term_counts(retried))}")
 
     @staticmethod
     def _clean_sql(raw_sql: str) -> str:
@@ -610,7 +902,7 @@ class ResearchEngine:
         if not parts:
             return pd.DataFrame()
         df = pd.concat(parts).drop_duplicates("rowid")
-        df["year"] = pd.to_numeric(df[DATE_COLUMN], errors="coerce") # numeric copy for sorting and the profile
+        df["year"] = df[DATE_COLUMN].map(_year) # numeric year for sorting and the profile
         return df.sort_values(["year", "rowid"]).reset_index(drop=True)
 
     @staticmethod
@@ -692,6 +984,7 @@ class ResearchEngine:
         if results.empty:
             self.results = self.context_df = pd.DataFrame()
             self.context_str, self.images, self.profile, self.ranking_note = "", [], "", ""
+            self.annotations_by_rowid, self.context_annotations = {}, {}
             return
 
         # The sample: which records the answer LLM reads in detail, and how they were chosen
@@ -726,15 +1019,284 @@ class ResearchEngine:
         self.context_df = (self.results[self.results["rowid"].isin(sample_ids)]
                            .sort_values("Artwork #").reset_index(drop=True))
 
-        # Context for the LLM (object number as identifier) and captioned images for the gallery
-        context_parts, self.images = [], []
+        # The researcher's annotations for these records, then the LLM's context and the gallery
+        self._refresh_annotations()
+        self._build_context()
+
+    def _refresh_annotations(self):
+        """
+        Reads the researcher's annotations and shows them in an 'annotations' column of both tables
+        """
+
+        self.annotations_by_rowid = all_annotations(self.ann_conn)
+        n_annotated = 0
+        for df in (self.results, self.context_df):
+            if df.empty:
+                continue
+            values = df["rowid"].map(lambda r: "; ".join(
+                f"A{a['id']}: {a['label'] or a['note'][:40]}" for a in self.annotations_by_rowid.get(int(r), [])))
+            if "annotations" in df.columns:
+                df["annotations"] = values
+            else:
+                df.insert(3, "annotations", values)
+            n_annotated = int((values != "").sum()) # the last loop is the context
+        self._trace(f"[Annotations] {n_annotated} of the {len(self.context_df)} artwork(s) in the context "
+                    f"carry a researcher annotation.")
+
+    def _build_context(self):
+        """
+        Context for the LLM (object number as identifier, plus the researcher's annotations) and captioned
+        images for the gallery. Separate from retrieve(), so a saved annotation can update the context
+        without searching again
+        """
+
+        context_parts, self.images, self.context_annotations = [], [], {}
         for _, row in self.context_df.iterrows():
             n, obj = row["Artwork #"], row[OBJECT_NUMBER_COLUMN]
             details = " | ".join(f"{label}: {row[col]}" for col, label in CONTEXT_FIELDS if _is_filled(row[col]))
-            context_parts.append(f"[Artwork #{n} | {obj}] {details}")
+            anns = self.annotations_by_rowid.get(int(row["rowid"]), [])
+            for ann in anns:
+                # Remember on which artworks in the context each annotation appears (for the block and the sources)
+                self.context_annotations.setdefault(ann["id"], {**ann, "artworks": []})["artworks"].append(n)
+            # The label inline, so the annotation is visible where the record is (the full note is in the block)
+            ann_labels = ", ".join(f"A{a['id']} ({a['label'] or a['note'][:40]})" for a in anns)
+            marker = f" | annotated: {ann_labels}" if anns else ""
+            context_parts.append(f"[Artwork #{n} | {obj}] {details}{marker}")
             if str(row[IMAGE_COLUMN]).startswith("http"):
                 self.images.append((row[IMAGE_COLUMN], f"Artwork #{n} ({obj}) - {row[TITLE_COLUMN]}"))
+
+        # Each annotation once, in its own block: small models pick up a labelled section more reliably
+        # than lines repeated under several artworks
+        if self.context_annotations:
+            block = ["RESEARCHER ANNOTATIONS (the researcher's own confirmed knowledge, not catalogue data):"]
+            for ann_id, ann in self.context_annotations.items():
+                on = ", ".join(f"#{n}" for n in ann["artworks"])
+                why = f"; proposed by the system because: {ann['reason']}" if ann["origin"] == "system" else ""
+                block.append(f"A{ann_id} on Artwork {on} ({ann['origin']}, {ann['status']}{why}): "
+                             f"{_annotation_text(ann)}")
+            context_parts.append("\n".join(block))
         self.context_str = "\n\n".join(context_parts)
+
+    # Annotations
+
+    def save_annotation(self, selected: list, label: str, note: str, grounds: Optional[list] = None) -> str:
+        """
+        Saves a researcher insight about one or more artworks in the context. It is stored in the annotations
+        database (never in the museum database), shown in the tables, and from now on given to the answer LLM
+        with every search or follow-up that retrieves these records. 'grounds' are the propagation grounds the
+        researcher chose for this insight (None = the default grounds)
+        """
+
+        numbers = sorted({int(m) for s in (selected or []) for m in re.findall(r"Artwork #(\d+)", s)})
+        if not numbers:
+            return "Select at least one artwork first."
+        if not (note or "").strip():
+            return "Write a note first."
+
+        rows = self.context_df[self.context_df["Artwork #"].isin(numbers)]
+        label = (label or "").strip() or None
+        ann_id = add_annotation(self.ann_conn, [int(r) for r in rows["rowid"]], note.strip(), label=label)
+
+        # Update the tables and the LLM's context without searching again, so a follow-up already uses it
+        self._refresh_annotations()
+        self._build_context()
+
+        artworks = ", ".join(f"#{n}" for n in numbers)
+        objects = ", ".join(rows[OBJECT_NUMBER_COLUMN].astype(str))
+        self._trace(f"[Annotations] Saved A{ann_id} on Artwork {artworks} ({objects})")
+        self._log("annotate", f"A{ann_id} on Artwork {artworks} ({objects})", "",
+                  _annotation_text({"label": label, "note": note.strip()}))
+
+        # The system's contribution: other prints this insight may also apply to (proposals, not knowledge)
+        grounds = PROPAGATION_DEFAULT_GROUNDS if grounds is None else list(grounds)
+        if not grounds:
+            self._trace(f"[Propagation] A{ann_id}: no grounds chosen, so no proposals.")
+            return (f"Saved as A{ann_id} on Artwork {artworks}. It is now part of the model's context. "
+                    f"No proposals: no grounds were chosen.")
+        n_proposed = self.propose_extensions(ann_id, rows, label, note.strip(), grounds)
+        proposed = (f" The system proposes {n_proposed} other print(s) it may also apply to: check them under "
+                    f"'Proposed extensions'." if n_proposed else " The system found no other prints to propose.")
+        return f"Saved as A{ann_id} on Artwork {artworks}. It is now part of the model's context.{proposed}"
+
+    def propose_extensions(self, ann_id: int, rows: pd.DataFrame, label: Optional[str], note: str,
+                           grounds: Optional[list] = None) -> int:
+        """
+        Proposes other prints a saved insight may also apply to, on three grounds (each proposal records which):
+        - same design: visually near-identical prints in the CLIP index (other impressions, states or copies).
+          Note that impressions from one plate look identical whatever their date
+        - visually similar: the few closest prints above a lower threshold (related compositions or motifs), for
+          insights about similarity or influence rather than identity
+        - same maker and date: other prints with exactly the same creator and creation date (e.g. one reissue
+          campaign), which visual similarity cannot separate from the originals
+        Only the grounds the researcher chose for this insight are used (None = the default grounds).
+        Proposals are saved as origin 'system', status 'proposed', and only count once the researcher confirms them
+        """
+
+        grounds = PROPAGATION_DEFAULT_GROUNDS if grounds is None else list(grounds)
+
+        # Prints that already carry this insight, or were already proposed for it (incl. rejected ones)
+        already = {int(r) for (r,) in self.ann_conn.execute(
+            "SELECT ar.rowid_ref FROM annotation_records ar JOIN annotations a ON a.id = ar.annotation_id "
+            "WHERE a.id = ? OR a.based_on = ?", (ann_id, ann_id))}
+        candidates = {} # rowid -> reason (the first reason found wins)
+
+        # Visual neighbours of the annotated prints, once for both visual grounds: (candidate, score, source print)
+        neighbours = self._visual_neighbours(rows, already) if (
+            GROUND_DESIGN in grounds or GROUND_SIMILAR in grounds) else []
+
+        # 1. Same design: near-identical neighbours
+        if GROUND_DESIGN in grounds:
+            for cand, score, source in neighbours:
+                if score >= PROPAGATION_SIMILARITY:
+                    candidates.setdefault(cand, f"same design: visually near-identical to {source} "
+                                                f"(similarity {score:.3f})")
+
+        # 2. Visually similar: the closest few above the lower threshold, not already proposed as 'same design'
+        if GROUND_SIMILAR in grounds:
+            similar = [(cand, score, source) for cand, score, source in neighbours
+                       if score >= PROPAGATION_SIMILAR_MIN and cand not in candidates]
+            for cand, score, source in similar[:PROPAGATION_SIMILAR_MAX]:
+                candidates.setdefault(cand, f"visually similar to {source} (similarity {score:.3f})")
+
+        # 3. Same maker and date: exact matches in the metadata
+        maker_dates = set(zip(rows[CREATOR_COLUMN], rows[DATE_COLUMN])) if GROUND_MAKER_DATE in grounds else set()
+        for creator, date in maker_dates:
+            if not (_is_filled(creator) and _is_filled(date)) or str(creator).lower() in ("anoniem", "anonymous"):
+                continue # without a named maker and a date this rule would match far too much
+            matches = [int(r) for (r,) in self.db_conn.execute(
+                f'SELECT rowid FROM {self.table_name} WHERE "{CREATOR_COLUMN}" = ? AND "{DATE_COLUMN}" = ?',
+                (creator, date)) if int(r) not in already]
+            if len(matches) > PROPAGATION_MAX_PER_RULE:
+                self._trace(f"[Propagation] Skipped 'same maker and date' ({creator}, {date}): {len(matches)} "
+                            f"prints is too generic to propose.")
+                continue
+            for cand in matches:
+                candidates.setdefault(cand, f"same maker and date: {creator}, {date}")
+
+        selected = list(candidates.items())[:PROPAGATION_MAX_TOTAL]
+        for cand, reason in selected:
+            add_annotation(self.ann_conn, [cand], note, label=label, origin="system", status="proposed",
+                           based_on=ann_id, reason=reason)
+        self._trace(f"[Propagation] A{ann_id}: {len(selected)} proposal(s) saved"
+                    + (f" ({len(candidates) - len(selected)} more left out, max {PROPAGATION_MAX_TOTAL})"
+                       if len(candidates) > len(selected) else ""))
+        self._log("propose", f"A{ann_id} (grounds: {', '.join(grounds)})", "",
+                  "; ".join(f"{c}: {r}" for c, r in selected))
+        return len(selected)
+
+    def _visual_neighbours(self, rows: pd.DataFrame, exclude: set) -> list:
+        """
+        Nearest neighbours in the visual index of each annotated print, as (rowid, similarity, inventory number of
+        the annotated print it resembles), best score per candidate, sorted from most to least similar
+        """
+
+        if not self.faiss_index.ntotal:
+            return []
+        best = {} # candidate -> (score, source)
+        for _, row in rows.iterrows():
+            pos = self.rowid_to_pos.get(int(row["rowid"]))
+            if pos is None:
+                continue # this print has no image in the index
+            vec = np.ascontiguousarray(self.faiss_index.reconstruct(pos), dtype="float32").reshape(1, -1)
+            scores, indices = self.faiss_index.search(vec, PROPAGATION_SEARCH_K)
+            for score, idx in zip(scores[0], indices[0]):
+                if idx == -1:
+                    continue
+                cand = int(self.row_ids[idx])
+                if cand not in exclude and score > best.get(cand, (-1.0, ""))[0]:
+                    best[cand] = (float(score), row[OBJECT_NUMBER_COLUMN])
+        return sorted(((c, sc, src) for c, (sc, src) in best.items()), key=lambda x: x[1], reverse=True)
+
+    def pending_proposals(self, limit: int = 60) -> list:
+        """
+        The system's open proposals, with the metadata the researcher needs to judge them
+        """
+
+        rows = self.ann_conn.execute("""
+            SELECT a.id, ar.rowid_ref, a.label, a.reason, a.based_on
+            FROM annotations a
+            JOIN annotation_records ar ON ar.annotation_id = a.id
+            WHERE a.origin = 'system' AND a.status = 'proposed'
+            ORDER BY a.id
+            LIMIT ?
+        """, (limit,)).fetchall()
+        if not rows:
+            return []
+
+        rowids = [int(r[1]) for r in rows]
+        placeholders = ",".join("?" for _ in rowids)
+        meta = {int(r[0]): r[1:] for r in self.db_conn.execute(
+            f'SELECT rowid, "{OBJECT_NUMBER_COLUMN}", "{TITLE_COLUMN}", "{DATE_COLUMN}", "{IMAGE_COLUMN}" '
+            f'FROM {self.table_name} WHERE rowid IN ({placeholders})', rowids)}
+        return [{"id": ann_id, "rowid": int(rid), "label": label, "reason": reason, "based_on": based_on,
+                 "object": meta[int(rid)][0], "title": meta[int(rid)][1], "date": meta[int(rid)][2],
+                 "image": meta[int(rid)][3]}
+                for ann_id, rid, label, reason, based_on in rows if int(rid) in meta]
+
+    def resolve_proposals(self, selected: list, status: str) -> str:
+        """
+        The researcher confirms (the insight now applies to these prints) or rejects (it doesn't) proposals
+        """
+
+        ids = sorted({int(m) for s in (selected or []) for m in re.findall(r"^A(\d+)", s)})
+        if not ids:
+            return "Select at least one proposal first."
+        set_annotation_status(self.ann_conn, ids, status)
+
+        # Confirmed proposals are knowledge now: update the tables and the LLM's context
+        self._refresh_annotations()
+        self._build_context()
+        listed = ", ".join(f"A{i}" for i in ids)
+        self._trace(f"[Propagation] {status.capitalize()}: {listed}")
+        self._log("confirm_proposals" if status == "confirmed" else "reject_proposals", listed, "", "")
+        return f"{status.capitalize()} {len(ids)} proposal(s): {listed}."
+
+    def draft_annotation(self, researcher_text: str) -> dict:
+        """
+        The LLM turns the researcher's own words into a draft annotation (artworks, label, note). Nothing is
+        saved here: the draft fills the panel, and the researcher checks, edits and saves it (human authority)
+        """
+
+        empty = {"numbers": [], "label": "", "note": ""}
+        if self.context_df.empty:
+            return {**empty, "message": "Search first: there are no artworks in the context."}
+        if not (researcher_text or "").strip():
+            return {**empty, "message": "Describe your insight first."}
+
+        artworks = "\n".join(f"Artwork #{row['Artwork #']} | {row[OBJECT_NUMBER_COLUMN]} | {row[TITLE_COLUMN]} | "
+                             f"{row[DATE_COLUMN]}" for _, row in self.context_df.iterrows())
+        messages = [
+            {"role": "system", "content": ANNOTATION_DRAFT_SYS},
+            {"role": "user", "content": f"Artworks on screen:\n{artworks}\nResearcher: {researcher_text.strip()}\nJSON:"},
+        ]
+        raw = generate_chat(messages, max_new_tokens=200) # deterministic: a draft should not be creative
+        self._trace(f"[Annotations] Draft for {researcher_text!r}: {raw}")
+
+        # Small models sometimes wrap the JSON in text or ``` fences, so take the first {...} block
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        try:
+            draft = json.loads(match.group(0)) if match else {}
+        except json.JSONDecodeError:
+            draft = {}
+        if not isinstance(draft, dict):
+            draft = {}
+
+        # Keep only artwork numbers that really are in the context (also accepts "#2" or "2")
+        valid = {int(n) for n in self.context_df["Artwork #"]}
+        numbers = sorted({int(d) for n in draft.get("artworks", []) or [] for d in re.findall(r"\d+", str(n))
+                          if int(d) in valid})
+
+        # The draft is logged too, so the session log shows what the model proposed and what was saved
+        self._log("draft_annotation", researcher_text.strip(), "", raw)
+
+        if not draft:
+            message = "The model's draft could not be read: fill in the fields yourself."
+        elif not numbers:
+            message = "Draft ready, but it's unclear which artworks are meant: tick them yourself, then Save."
+        else:
+            message = "Draft ready: check the artworks, label and note, edit if needed, then Save. Nothing is saved yet."
+        return {"numbers": numbers, "label": str(draft.get("label", "") or ""),
+                "note": str(draft.get("note", "") or ""), "message": message}
 
     # Synthesis
 
@@ -754,6 +1316,10 @@ class ResearchEngine:
                                f"({self.ranking_note}). Do not generalize from them to the full set of matches.\n")
         else:
             system_content += "\nNote: the context above contains ALL artworks that matched the search.\n"
+        if self.context_annotations:
+            ids = ", ".join(f"A{a}" for a in self.context_annotations)
+            system_content += (f"\nThe context contains {len(self.context_annotations)} annotation(s) written or "
+                               f"confirmed by the researcher: {ids}. Use them in your answer and cite them.\n")
         if self.image_analysis:
             system_content += (
                 "\nThe researcher also uploaded an image. An automatic (small-model) description "
@@ -778,7 +1344,8 @@ class ResearchEngine:
     def attach_sources(self, answer: str) -> str:
         """
         Adds, written by the code and not by the LLM: a scope line (what the answer is based on), the cited
-        records from the database (so every citation can be checked), and warnings for invalid or missing citations
+        records from the database and the cited researcher annotations (so every citation can be checked),
+        and warnings for invalid or missing citations
         """
 
         n_read, n_total = len(self.context_df), len(self.results)
@@ -786,7 +1353,8 @@ class ResearchEngine:
                  f"[Based on {n_read} of {n_total} matching records: {self.ranking_note}. "
                  f"Exact figures over all matches are in the profile.]")
 
-        cited = sorted({int(n) for n in re.findall(r"Artwork #(\d+)", answer)})
+        # Case-insensitive: small models also write "artwork #4"
+        cited = sorted({int(n) for n in re.findall(r"Artwork #(\d+)", answer, flags=re.IGNORECASE)})
         lines = []
         for n in cited:
             match = self.context_df[self.context_df["Artwork #"] == n]
@@ -796,12 +1364,63 @@ class ResearchEngine:
             row = match.iloc[0]
             lines.append(f"Artwork #{n}: " + " | ".join(str(row[c]) for c in (
                 OBJECT_NUMBER_COLUMN, TITLE_COLUMN, CREATOR_COLUMN, DATE_COLUMN, HANDLE_COLUMN) if _is_filled(row[c])))
+
+        # Cited annotations: shown with their provenance, so researcher knowledge is never mistaken for catalogue data
+        # Also bare "A6": the model doesn't always write "Annotation A6"
+        mentioned = {int(a) for a in re.findall(r"(?<![-\w])(?:Annotation\s+)?A(\d+)\b", answer)}
+        for a in sorted(mentioned):
+            ann = self.context_annotations.get(a)
+            if ann is None:
+                lines.append(f"WARNING: the answer cites Annotation A{a}, which is not in the context.")
+                continue
+            on = ", ".join(f"#{n}" for n in ann["artworks"])
+            lines.append(f"Annotation A{a} ({ann['origin']}, {ann['status']}, on Artwork {on}): {_annotation_text(ann)}")
+
         if not cited:
             lines.append("WARNING: the answer cites no specific records; its claims are not grounded in the data.")
         self._trace("[Check] " + ("; ".join(l for l in lines if l.startswith("WARNING")) or
                                   "All cited artwork numbers exist in the context."))
+
+        # Which annotations in the context the answer actually mentioned (logged, and marked in the block below)
+        self.last_cited_annotations = sorted(mentioned & set(self.context_annotations))
+        if self.context_annotations:
+            self._trace(f"[Check] Annotations in the context: {len(self.context_annotations)}; mentioned in the "
+                        f"answer: {len(self.last_cited_annotations)}")
+
         return (scope + "\n\n" + answer + "\n\n---\nSources (from the database, not generated by the model):\n"
-                + "\n".join(lines))
+                + "\n".join(lines) + self._known_block(set(self.last_cited_annotations)))
+
+    def _known_block(self, mentioned: set) -> str:
+        """
+        Every annotation on the records in the context, grouped by label and written by the CODE, not the model:
+        the researcher always sees the relevant knowledge, also when the answer leaves it out. Groups the answer
+        didn't mention are marked, so a gap between what is known and what was said is visible
+        """
+
+        if not self.context_annotations:
+            return ""
+        groups = {}
+        for ann_id, ann in self.context_annotations.items():
+            key = (ann["label"] or ann["note"][:40]).strip().lower()
+            groups.setdefault(key, []).append((ann_id, ann))
+
+        lines = ["", "", "Known about these records (annotations, listed by the code, not generated by the model):"]
+        for anns in groups.values():
+            first = anns[0][1]
+            label = first["label"] or first["note"][:40]
+            artworks = ", ".join(f"#{n}" for n in sorted({n for _, a in anns for n in a["artworks"]}))
+            ids = ", ".join(f"A{i}" for i, _ in anns)
+            n_researcher = sum(1 for _, a in anns if a["origin"] == "researcher")
+            n_system = len(anns) - n_researcher
+            origin = "; ".join(part for part in (
+                f"{n_researcher} by the researcher" if n_researcher else "",
+                f"{n_system} proposed by the system and confirmed" if n_system else "") if part)
+            # The researcher's own note describes the insight best, if there is one
+            note = next((a["note"] for _, a in anns if a["origin"] == "researcher"), first["note"])
+            flag = "" if any(i in mentioned for i, _ in anns) else " [not mentioned in the answer]"
+            lines.append(f"- {label}: Artwork {artworks} ({ids}; {origin}){flag}")
+            lines.append(f"  {note}")
+        return "\n".join(lines)
 
     # Top-level orchestration
 
@@ -836,13 +1455,15 @@ class ResearchEngine:
             self._trace(f"[SQL] Experimental: condensed image hints for SQL = {hints!r}")
             sql_question = f"{sql_question} {hints}".strip()
 
-        sql, sql_ids, sql_for_ids = "", [], ""
+        sql, sql_ids, sql_for_ids, term_note = "", [], "", ""
         if sql_question:
             try:
                 sql = self.generate_sql(sql_question)
                 self._trace(f"[SQL] Generated SQL: {sql}")
                 sql_ids, sql_for_ids = self.run_sql(sql)
                 self._trace(f"[SQL] Matched {len(sql_ids)} row(s): {_preview_ids(sql_ids)}")
+                if not sql_ids: # SQL guardrail: which terms don't occur in the catalogue, then one retry
+                    sql, sql_ids, sql_for_ids, term_note = self._check_empty_result(sql, sql_question)
             except Exception as e:
                 self._trace(f"[SQL Error] {e}")
         else:
@@ -869,7 +1490,7 @@ class ResearchEngine:
         self.last_question = (user_input or "").strip() or (
             "Describe the retrieved artworks and how they relate to the uploaded image." if image_mode
             else "Describe and compare the retrieved artworks.")
-        return self._finish("new_search", user_input, self.last_question, sql)
+        return self._finish("new_search", user_input, self.last_question, sql, term_note)
 
     def refine_search(self, instruction: str):
         """
@@ -898,6 +1519,8 @@ class ResearchEngine:
         warning = (f"NOTE: {n_outside} of the {len(sql_ids)} matches were NOT in the previous result set, so this "
                    f"refinement widened or changed the search instead of narrowing it. Check the SQL."
                    if n_outside else "")
+        if not sql_ids:
+            warning = self._check_empty_result(refined_sql)[3] # term counts only, no retry
         self._trace(f"[Refine] {warning or f'All {len(sql_ids)} matches lie within the previous {len(previous)}.'}")
 
         self.retrieve(sql_ids, sql_for_ids, self.last_vector_hits, self.last_search_was_image, self.last_query_vec)
@@ -935,9 +1558,12 @@ class ResearchEngine:
         except Exception as e:
             return self._error(f"SQL rejected: {e}", edited_sql)
 
+        # The researcher's own query is never rewritten; an empty result only gets the term counts
+        warning = self._check_empty_result(edited_sql)[3] if not sql_ids else ""
         self.retrieve(sql_ids, sql_for_ids, self.last_vector_hits, self.last_search_was_image, self.last_query_vec)
         self.last_sql, self.last_sql_ids = edited_sql, sql_ids
-        return self._finish("rerun_sql", "(edited SQL)", "Describe and compare the retrieved artworks.", edited_sql)
+        return self._finish("rerun_sql", "(edited SQL)", "Describe and compare the retrieved artworks.", edited_sql,
+                            warning)
 
     def _finish(self, mode: str, log_query: str, question: str, sql: str, warning: str = ""):
         """
@@ -945,6 +1571,7 @@ class ResearchEngine:
         """
 
         self.history = []
+        self.last_cited_annotations = [] # stays empty when there is no answer, so the log doesn't repeat old citations
         answer = self.synthesize(question) if not self.context_df.empty else "No artworks matched this query."
         if warning:
             answer = f"{warning}\n\n{answer}"
@@ -974,6 +1601,11 @@ class ResearchEngine:
             "total_matches": len(self.results),
             "ranking_note": self.ranking_note,
             "context_records": ";".join(self.context_df[OBJECT_NUMBER_COLUMN].astype(str)) if not self.context_df.empty else "",
+            # Which annotations the model had in its context, so the log shows whether it COULD have used them
+            "context_annotations": ";".join(f"A{a}" for a in self.context_annotations),
+            # ...and which of them the answer actually mentioned (context vs mentioned = annotation use)
+            "cited_annotations": ";".join(f"A{a}" for a in self.last_cited_annotations)
+                                 if mode in ("new_search", "refine", "follow_up", "rerun_sql") else "",
             "llm": LLM_MODEL_NAME,
         })
 
@@ -981,7 +1613,8 @@ class ResearchEngine:
         out_path = str(CURRENT_DIR / "session_log.csv")
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["timestamp", "mode", "query", "sql", "answer", "total_matches",
-                                                   "ranking_note", "context_records", "llm"])
+                                                   "ranking_note", "context_records", "context_annotations",
+                                                   "cited_annotations", "llm"])
             writer.writeheader()
             writer.writerows(self.session_log)
         return out_path
@@ -998,10 +1631,20 @@ class ResearchEngine:
         return out_path
 
 
-engine = ResearchEngine(conn, MAIN_TABLE, faiss_index, faiss_row_ids, embedding_model)
+annotations_conn = open_annotations(ANNOTATIONS_PATH) # creates the file if needed, so it can be attached
+attach_annotations(conn, ANNOTATIONS_PATH)
+engine = ResearchEngine(conn, MAIN_TABLE, faiss_index, faiss_row_ids, embedding_model, annotations_conn)
 
 
 # 8. GRADIO FRONTEND INTERFACE
+
+
+def _artwork_choices() -> list:
+    # One checkbox per artwork in the model's context, e.g. 'Artwork #2 - Presentatie van Maria'
+    if engine.context_df.empty:
+        return []
+    return [f"Artwork #{n} - {str(t)[:60]}" for n, t in
+            zip(engine.context_df["Artwork #"], engine.context_df[TITLE_COLUMN])]
 
 
 def _outputs(result: dict) -> tuple:
@@ -1011,8 +1654,10 @@ def _outputs(result: dict) -> tuple:
                                  label=f"Records in the model's context: {n_context} of {n_all} matches (what the AI reads)")
     all_table = gr.Dataframe(value=result["all_matches"], label=f"All matches: {n_all} records found by the search" + (
         f" (first {MAX_RESULT_ROWS_DISPLAY} shown here; the CSV export has all)" if n_all > MAX_RESULT_ROWS_DISPLAY else ""))
+    # The annotation checkboxes always list the artworks currently in the context
+    artwork_boxes = gr.CheckboxGroup(choices=_artwork_choices() if result["n_matches"] else [], value=[])
     return (result["answer"], result["images"], result["sql"], context_table, pd.DataFrame(engine.session_log),
-            result["trace"], result["vlm_description"], result["profile"], all_table)
+            result["trace"], result["vlm_description"], result["profile"], all_table, artwork_boxes)
 
 
 def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: str,
@@ -1020,7 +1665,8 @@ def handle_query(user_query: str, uploaded_image: Optional[Image.Image], mode: s
     if not user_query or not user_query.strip():
         if mode != "New search" or uploaded_image is None:
             return ("Please provide a question or upload an image.", [], "", pd.DataFrame(),
-                    pd.DataFrame(engine.session_log), "", "", "", pd.DataFrame())
+                    pd.DataFrame(engine.session_log), "", "", "", pd.DataFrame(),
+                    gr.CheckboxGroup(choices=_artwork_choices(), value=[]))
     try:
         image = uploaded_image.convert("RGB") if uploaded_image is not None else None
         if mode == "New search":
@@ -1046,6 +1692,47 @@ def handle_rerun_sql(edited_sql: str):
         return _outputs(engine._error(f"Error: {e}", edited_sql))
 
 
+def _proposal_outputs() -> tuple:
+    # Open proposals as images (to judge by eye) and as checkboxes 'A12 - RP-P-... (1602) title: reason'
+    proposals = engine.pending_proposals()
+    gallery = [(p["image"], f"A{p['id']} · {p['object']} · {p['date']}") for p in proposals
+               if str(p["image"]).startswith("http")]
+    choices = [f"A{p['id']} - {p['object']} ({p['date']}) {str(p['title'])[:40]}: {p['reason']}" for p in proposals]
+    return gallery, gr.CheckboxGroup(choices=choices, value=[])
+
+
+def handle_save_annotation(selected: list, label: str, note: str, grounds: list):
+    try:
+        status = engine.save_annotation(selected, label, note, grounds)
+    except Exception as e:
+        status = f"Error: {e}"
+    saved = status.startswith("Saved")
+    # Clear the fields after a successful save; keep them (to correct) after a warning or error
+    return (status, engine.context_df, engine.results.head(MAX_RESULT_ROWS_DISPLAY), pd.DataFrame(engine.session_log),
+            "" if saved else label, "" if saved else note, "" if saved else gr.update(), *_proposal_outputs())
+
+
+def handle_resolve_proposals(selected: list, status: str):
+    try:
+        message = engine.resolve_proposals(selected, status)
+    except Exception as e:
+        message = f"Error: {e}"
+    return (message, engine.context_df, engine.results.head(MAX_RESULT_ROWS_DISPLAY), pd.DataFrame(engine.session_log),
+            *_proposal_outputs())
+
+
+def handle_draft_annotation(researcher_text: str):
+    try:
+        draft = engine.draft_annotation(researcher_text)
+    except Exception as e:
+        draft = {"numbers": [], "label": "", "note": "", "message": f"Error: {e}"}
+    # Tick the drafted artworks (the values must match the checkbox labels exactly)
+    choices = _artwork_choices()
+    selected = [c for c in choices if int(re.match(r"Artwork #(\d+)", c).group(1)) in draft["numbers"]]
+    return (gr.CheckboxGroup(choices=choices, value=selected), draft["label"], draft["note"], draft["message"],
+            pd.DataFrame(engine.session_log))
+
+
 with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
     gr.Markdown(
         f"""
@@ -1059,6 +1746,7 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
 
         The model reads a **sample** of the matches in detail; exact figures about **all** matches
         are in the profile, and the full result set is in the "All matches" table and CSV export.
+        Insights you add are saved separately and used in every later search that retrieves those records.
         """
     )
 
@@ -1109,6 +1797,42 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
                                      interactive=False)
             output_gallery = gr.Gallery(label="Matched artwork images (in the model's context)", columns=3, height=300)
             output_table = gr.Dataframe(label="Records in the model's context", wrap=True)
+
+            # Researcher insights: saved in the annotations database, shown in the tables and given to the LLM
+            with gr.Accordion("Add an insight about the artworks in the context", open=True):
+                # Optional: describe the insight freely and let the LLM fill in the fields below (nothing is saved
+                # until you click Save)
+                annotation_input = gr.Textbox(label="Your insight in your own words (optional)", lines=2,
+                                              placeholder="e.g. #2 is a later state of #1, the address was "
+                                                          "changed")
+                draft_annotation_btn = gr.Button("Draft with AI")
+                annotation_artworks = gr.CheckboxGroup(label="Artworks", choices=[])
+                annotation_label = gr.Textbox(label="Label (short)", placeholder="e.g. later state")
+                annotation_note = gr.Textbox(label="Note", lines=3,
+                                             placeholder="e.g. A later state of the same plate, with a changed "
+                                                         "publisher's address.")
+                # Not every insight travels the same way: choose on which grounds the system may propose other prints
+                annotation_grounds = gr.CheckboxGroup(
+                    label="Propose other prints this insight may apply to, by",
+                    choices=PROPAGATION_GROUNDS, value=PROPAGATION_DEFAULT_GROUNDS,
+                    info=("e.g. a copy follows the design, an influence looks similar, a reissue may follow the date; "
+                          "untick all for no proposals"),
+                )
+                save_annotation_btn = gr.Button("Save insight")
+                annotation_status = gr.Markdown()
+
+                # The system's contribution: other prints a saved insight may also apply to. Nothing counts as
+                # knowledge (or reaches the LLM) until you confirm it; rejected proposals are never proposed again
+                gr.Markdown("**Proposed extensions** (suggested by the system). Confirm what you checked and agree "
+                            "with; reject only what you checked and found wrong. Leave unsure ones unticked: they "
+                            "stay open for later.")
+                proposal_gallery = gr.Gallery(label="Proposed prints", columns=4, height=220)
+                proposal_choices = gr.CheckboxGroup(label="Proposals", choices=[])
+                with gr.Row():
+                    confirm_btn = gr.Button("Confirm selected (insight applies)")
+                    reject_btn = gr.Button("Reject selected (does not apply, never proposed again)")
+                proposal_status = gr.Markdown()
+
             all_matches_table = gr.Dataframe(label="All matches", wrap=True)
             vlm_box = gr.Textbox(label="VLM description of uploaded image", lines=3, interactive=False)
             with gr.Accordion("Retrieval trace (debug)", open=False):
@@ -1116,13 +1840,32 @@ with gr.Blocks(title="Rijksmuseum Research Assistant") as demo:
             session_log_table = gr.Dataframe(label="Session log", wrap=True)
 
     all_outputs = [output_answer, output_gallery, sql_box, output_table, session_log_table, trace_box, vlm_box,
-                   profile_box, all_matches_table]
+                   profile_box, all_matches_table, annotation_artworks]
     submit_btn.click(
         fn=handle_query,
         inputs=[user_input, image_input, mode_toggle, vector_for_text_checkbox, caption_for_sql_checkbox],
         outputs=all_outputs,
     )
     rerun_btn.click(fn=handle_rerun_sql, inputs=[sql_box], outputs=all_outputs)
+    save_annotation_btn.click(
+        fn=handle_save_annotation,
+        inputs=[annotation_artworks, annotation_label, annotation_note, annotation_grounds],
+        outputs=[annotation_status, output_table, all_matches_table, session_log_table, annotation_label,
+                 annotation_note, annotation_input, proposal_gallery, proposal_choices],
+    )
+    proposal_outputs = [proposal_status, output_table, all_matches_table, session_log_table, proposal_gallery,
+                        proposal_choices]
+    confirm_btn.click(fn=lambda sel: handle_resolve_proposals(sel, "confirmed"), inputs=[proposal_choices],
+                      outputs=proposal_outputs)
+    reject_btn.click(fn=lambda sel: handle_resolve_proposals(sel, "rejected"), inputs=[proposal_choices],
+                     outputs=proposal_outputs)
+    # Open proposals from earlier sessions are shown as soon as the app opens
+    demo.load(fn=_proposal_outputs, outputs=[proposal_gallery, proposal_choices])
+    draft_annotation_btn.click(
+        fn=handle_draft_annotation,
+        inputs=[annotation_input],
+        outputs=[annotation_artworks, annotation_label, annotation_note, annotation_status, session_log_table],
+    )
     export_results_btn.click(fn=engine.export_results_csv, outputs=[export_results_file])
     export_btn.click(fn=engine.export_log_csv, outputs=[export_file])
 
